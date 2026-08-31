@@ -105,6 +105,19 @@ fn synthetic_audio(seconds: f32, sample_rate: u32) -> Vec<f32> {
 }
 
 fn main() -> Result<()> {
+    // ORT names the provider it registered and the one it declined, with the
+    // reason, at debug level. Without a subscriber those events are dropped and
+    // a CUDA failure is indistinguishable from a CUDA success that used no
+    // memory. Default filter rather than RUST_LOG-only so the gate is verbose by
+    // construction; RUST_LOG still overrides it.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,ort=debug")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let model_dir: PathBuf = std::env::var("STT_MODEL_DIR")
         .unwrap_or_else(|_| "/models/tdt".into())
         .into();
@@ -178,9 +191,12 @@ fn main() -> Result<()> {
         bail!(
             "GATE FAILED: GPU memory grew by only {delta} MiB (< {MIN_DELTA_MIB} MiB) across \
              model load and warmup. CUDA did not engage and ORT fell back to CPU — parakeet-rs \
-             does this silently by design. Check that the pod has runtimeClassName: nvidia and \
-             an nvidia.com/gpu limit, that the image's CUDA/cuDNN majors match what ort \
-             2.0.0-rc.13 links, and that ExecutionProvider::Cuda reached from_pretrained."
+             does this silently by design. Read the ort=debug lines above first; they name the \
+             provider that was declined. The two causes already found and fixed once, both in \
+             the Dockerfile: libonnxruntime_providers_cuda.so missing from /usr/local/bin \
+             (ORT dlopens it next to the binary), and a CUDA major mismatch — ort-sys ships no \
+             CUDA 12 build for Linux, so the base image must be CUDA 13. Then check the pod has \
+             runtimeClassName: nvidia and an nvidia.com/gpu limit."
         );
     }
 

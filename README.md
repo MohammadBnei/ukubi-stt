@@ -59,7 +59,7 @@ ParakeetTDT::from_pretrained(dir, Some(cfg))?
 ## Running the gate
 
 ```bash
-git tag 0.1.0 && git push --tags        # builds on the build-runner LXC
+git tag 0.2.0 && git push --tags        # builds on the build-runner LXC (tag == Cargo.toml version)
 kubectl apply -f k8s/gate-pod.yaml
 kubectl logs -f stt-gate
 ```
@@ -76,22 +76,62 @@ GATE PASSED: CUDA engaged (1839 MiB resident), RTF 0.041
 
 A delta under 128 MiB is a failure regardless of how good the transcript looks.
 
-### Known unknowns the gate is there to find
+### What the first run found (2026-08-31)
 
-1. **CUDA/cuDNN majors.** `ort 2.0.0-rc.13` links a prebuilt ONNX Runtime whose
-   majors must match the base image. `nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04`
-   is a guess. The host driver (580.173.02) covers CUDA 12.x and 13.x, so the
-   driver is not the constraint — the ORT build is. Failure at *session
-   creation* rather than at the memory assertion points here.
-2. **Whether `ort` can find its CUDA libraries at runtime.** May need the
-   `load-dynamic` feature or `ORT_DYLIB_PATH`. Note this is a *runtime*
-   question and remains open — CI settled only the build half: `ort` with
-   `parakeet-rs/cuda` compiles fine on a GitHub runner with no CUDA toolkit
-   installed, so nothing about the CUDA path blocks a plain `cargo build`.
-3. **Whether `ParakeetTDT` is `Send`.** Not needed for this single-threaded
-   binary, but the gRPC server's design depends on it — if it is not, the model
-   needs a dedicated thread and a channel rather than a mutex. Compiling this
-   binary does not exercise it.
+The gate ran and **failed**, exactly as designed to:
+
+```
+gpu.used before load : 1 MiB
+model loaded in      : 2.4s
+gpu.used after warmup: 1 MiB (delta 0 MiB)
+real-time factor     : 0.081
+GATE FAILED: GPU memory grew by only 0 MiB (< 128 MiB)
+```
+
+An RTF of 0.081 is 12x faster than realtime and reads as a healthy GPU result.
+Without the memory assertion this would have shipped as a working GPU service
+decoding entirely on CPU. `nvidia-smi` answered *inside the container*, so the
+RuntimeClass, device plugin and `nvidia.com/gpu` request were all correct — the
+fault was above them.
+
+Two independent bugs, both in the Dockerfile, both now fixed:
+
+1. **`libonnxruntime_providers_cuda.so` was never in the image.** ONNX Runtime
+   is linked statically (`ldd` on the binary shows no `libonnxruntime`), but its
+   CUDA provider is not part of that archive — it is a separate 79MB shared
+   object ORT dlopens *next to the calling module*, i.e. next to the executable.
+   The build produced it and only the binary was copied out.
+
+   Compounding it: ort-sys's `copy-dylibs` **symlinks** these into
+   `target/release/` from `~/.cache/ort.pyke.io/dfbin/`, so a naive
+   `COPY --from=build target/release/*.so` lands dangling links and fails
+   identically. `cp -L` first.
+
+2. **The CUDA major was wrong, and could only ever have been wrong.** ort-sys
+   2.0.0-rc.13 does not build ONNX Runtime — it downloads a prebuilt one chosen
+   from a hardcoded table (`build/download/dist.tsv`). For
+   `x86_64-unknown-linux-gnu` that table holds four rows: no-features, `webgpu`,
+   `nvrtx`, and `cuda13,tensorrt,nvrtx`. **No CUDA 12 build exists for Linux**,
+   and the resolver's own fallback comment says `"guessing 13"`. Building in a
+   CUDA 12.6 image therefore produced a binary wanting `libcudart.so.13`.
+
+   Its real dependency set, read off the provider rather than assumed:
+   `libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`, `libcurand.so.10`,
+   `libcuda.so.1` — plus `libcudnn.so.9` and `libcufft.so.12` dlopened lazily by
+   name, which is why the runtime image keeps the `-cudnn-` variant even though
+   nothing links cuDNN. Driver 580.173.02 is a CUDA 13.0 driver, and the
+   provider's embedded arch list carries `sm_75`, so Turing is covered.
+
+`ORT_CUDA_VERSION=13` is now set in the builder so that resolution is read
+rather than guessed, and the binary logs ORT's own `debug` events — which
+report which provider was declined and why — instead of dropping them.
+
+### Still unknown
+
+**Whether `ParakeetTDT` is `Send`.** Not needed for this single-threaded
+binary, but the gRPC server's design depends on it — if it is not, the model
+needs a dedicated thread and a channel rather than a mutex. Compiling this
+binary does not exercise it.
 
 ## If the gate fails
 
@@ -135,8 +175,10 @@ Gate 0 runs on real hardware.
 release candidate by design, so a clean audit is not achievable on demand and a
 permanently-red check trains people to ignore it.
 
-**Rollback** is redeploying an earlier tag — the registry keeps the last 3 plus
-`latest` (ADR-0034), so anything older than that is gone and must be rebuilt.
+**Rollback** is redeploying an earlier tag — and this repo's retention is
+tighter than the cluster default: zot keeps the last **2** tags plus `latest`
+for `ukubi-stt` (3 everywhere else), because the image is a ~5GB CUDA tree.
+Anything older is GC'd from Garage and must be rebuilt.
 
 ## Local build
 

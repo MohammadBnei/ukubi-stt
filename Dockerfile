@@ -2,14 +2,31 @@
 # in-cluster — buildah needs CAP_SYS_ADMIN and ADR-0034 keeps that off the
 # cluster.
 #
-# THE CUDA/cuDNN MAJORS HERE ARE THE GATE'S FIRST UNKNOWN.
-# ort 2.0.0-rc.13 links a prebuilt ONNX Runtime whose CUDA and cuDNN majors must
-# match these images, and the host driver must satisfy that CUDA major.
-# k8s-worker-01 runs 580.173.02, which covers CUDA 12.x and 13.x, so the driver
-# is not the constraint — the ORT build is. CUDA 12.6 + cuDNN 9 is the current
-# best guess. If the gate fails at ONNX session creation rather than at the
-# memory assertion, these two lines are the first thing to change.
-ARG CUDA_VERSION=12.6.3
+# THE CUDA MAJOR IS 13, AND THAT IS NOT A CHOICE — IT IS A CONSTRAINT.
+# ort-sys 2.0.0-rc.13 does not build ONNX Runtime; it downloads a prebuilt one
+# from pyke's CDN, chosen from a hardcoded table (`build/download/dist.tsv`).
+# For x86_64-unknown-linux-gnu that table has exactly four rows: no-features,
+# `webgpu`, `nvrtx`, and `cuda13,tensorrt,nvrtx`. **There is no CUDA 12 build
+# for Linux.** Its own resolver says so out loud:
+#
+#     _ => { log::debug!("couldn't determine CUDA version, guessing 13");
+#            "cuda13" } // "fallback" to the lowest version we ship
+#
+# So the first version of this file — CUDA 12.6.3 — produced a binary linked
+# against an ONNX Runtime whose CUDA provider wants libcudart.so.13. That is
+# the first of the two bugs that made Gate 0 fail on 2026-08-31.
+#
+# ORT_CUDA_VERSION is set below so the resolver reads the answer instead of
+# guessing it. Driver 580.173.02 on k8s-worker-01 is a CUDA 13.0 driver
+# (>= 580.65.06 required), and CUDA 13.0 still supports Turing sm_75 — verified
+# directly in the provider's embedded arch list, which carries sm_75.
+ARG CUDA_VERSION=13.0.3
+# -cudnn- is load-bearing on the RUNTIME image and not obvious from linkage:
+# libonnxruntime_providers_cuda.so has no DT_NEEDED entry for cuDNN, it dlopens
+# `libcudnn.so.9` by name at first use. Its real DT_NEEDED set is
+# libcudart.so.13, libcublas.so.13, libcublasLt.so.13, libcurand.so.10 and
+# libcuda.so.1 (the last injected by the container toolkit).
+#
 # ubuntu24.04, not 22.04. The ONNX Runtime binary that ort downloads is built
 # against a NEWER toolchain than 22.04 ships: linking on 22.04 fails with
 # `undefined symbol: __isoc23_strtoll` (glibc 2.38+) and
@@ -31,6 +48,13 @@ ARG UBUNTU_VERSION=ubuntu24.04
 #   - ort's `cuda` feature may want CUDA headers present at build time; -devel
 #     has them and -runtime does not.
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-${UBUNTU_VERSION} AS build
+
+# Read, do not guess. ort-sys sniffs NV_CUDA_CUDART_VERSION, CUDA_HOME and
+# `nvcc --version` for a CUDA 13 signature and falls back to "guessing 13" when
+# none matches — which means a CUDA 12 builder silently produces a CUDA 13
+# binary and says nothing. Stating it here makes the resolution explicit and
+# makes a future CUDA 14 row in dist.tsv a one-line change.
+ENV ORT_CUDA_VERSION=13
 
 # libssl-dev is required and its absence is not obvious: something in the
 # parakeet-rs/ort tree pulls openssl-sys, whose build script fails with
@@ -57,6 +81,30 @@ COPY src ./src
 # cargo fingerprints on content+mtime; the stub above already produced a binary,
 # so touch to force the real main.rs to compile over it.
 RUN touch src/main.rs && cargo build --release
+
+# THE SECOND BUG THAT FAILED GATE 0: these two files were never shipped.
+#
+# ONNX Runtime is linked statically (`libonnxruntime.a`, hence no libonnxruntime
+# in `ldd`), but its CUDA execution provider is NOT part of that archive. It is
+# a separate shared object that ORT dlopens by name on first use, resolved
+# against the directory of the calling module — for a static link, the directory
+# of the executable itself. If it is absent, provider registration fails, ORT
+# falls through to CPU, and parakeet-rs says nothing because `error_on_failure()`
+# sits on the CPU provider, not on CUDA.
+#
+# `cp -L` is mandatory. ort-sys's `copy-dylibs` feature does not copy anything on
+# Unix — it SYMLINKS these into target/release/ from ~/.cache/ort.pyke.io/dfbin/.
+# A plain `COPY --from=build` of the symlink lands a dangling link in the runtime
+# image, which fails exactly the same way as the file being missing.
+#
+# Named explicitly rather than globbed so a rename upstream is a build failure
+# here, not a silent CPU fallback in production. The tensorrt/nvrtx providers
+# from the same distribution are deliberately left behind — they need libnvinfer
+# and nothing asks for them.
+RUN mkdir -p /ortlib \
+ && cp -L target/release/libonnxruntime_providers_shared.so \
+          target/release/libonnxruntime_providers_cuda.so /ortlib/ \
+ && ls -la /ortlib
 
 
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-${UBUNTU_VERSION}
@@ -89,7 +137,12 @@ RUN mkdir -p /models/tdt && cd /models/tdt \
     done \
  && ls -la /models/tdt
 
+# The providers go NEXT TO the binary, not in a lib directory, and that is the
+# whole point: ORT resolves them relative to the calling module's own path
+# (dladdr -> dirname), so /usr/local/lib would not be looked at.
 COPY --from=build /src/target/release/ukubi-stt /usr/local/bin/ukubi-stt
+COPY --from=build /ortlib/libonnxruntime_providers_shared.so /usr/local/bin/
+COPY --from=build /ortlib/libonnxruntime_providers_cuda.so /usr/local/bin/
 
 ENV STT_MODEL_DIR=/models/tdt
 ENTRYPOINT ["/usr/local/bin/ukubi-stt"]

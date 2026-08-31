@@ -33,20 +33,23 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
-      # --features cuda because src/main.rs references ExecutionProvider::Cuda,
-      # which only exists under that cfg — checking without it would compile a
-      # different program than the one that ships.
+      # No --features flag. `--features` selects features of THIS package, and
+      # ukubi-stt declares none — parakeet-rs/cuda is turned on unconditionally
+      # in Cargo.toml, so a plain build already compiles exactly the program
+      # that ships, ExecutionProvider::Cuda included. An earlier
+      # `--features cuda` here failed with "the package 'ukubi-stt' does not
+      # contain this feature", which is the distinction stated out loud.
       #
-      # Whether ort 2.0.0-rc.13 can resolve its CUDA build on a runner with no
-      # CUDA toolkit is genuinely unknown. If this step fails at ort's build
-      # script rather than on our code, that is useful information for Gate 0
-      # and the fix is to split it: `cargo check` on default features for our
-      # own code, and leave the CUDA path to the real build.
+      # Whether ort 2.0.0-rc.13 resolves its CUDA build on a runner with no CUDA
+      # toolkit is still genuinely unknown. If this fails inside ort's build
+      # script rather than on our code, that is information Gate 0 wants, and
+      # the fix is a real `cuda` feature on this package so CI can check the CPU
+      # path while the image keeps the GPU one.
       - name: Clippy
-        run: cargo clippy --features cuda --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --features cuda
+        run: cargo test
 
   audit:
     runs-on: ubuntu-latest

@@ -1,0 +1,26 @@
+[package]
+name = "ukubi-stt"
+version = "0.1.0"
+edition = "2021"
+description = "GPU speech-to-text for ukubi-cluster (ADR-0044)"
+license = "MIT"
+
+[dependencies]
+# `cuda` ENABLES the CUDA execution provider; it does NOT select it. Selection
+# is ExecutionConfig::new().with_execution_provider(ExecutionProvider::Cuda) at
+# load time — from_pretrained(path, None) silently defaults to CPU. Both halves
+# are required. See src/main.rs.
+#
+# Default features are kept on deliberately (cpu, ort-defaults, api-28): the CPU
+# provider is registered as ORT's fallback behind CUDA either way, so removing it
+# would not make a CUDA failure louder. Decision 3's assertion is what makes it
+# loud.
+parakeet-rs = { version = "0.3.7", features = ["cuda"] }
+
+# Pinned EXACTLY, not with a caret: ort is a release candidate (2.0.0-rc.13 is
+# the newest published version; there is no stable release). A caret range on a
+# pre-1.0 rc is how a build silently moves to a different ONNX Runtime ABI.
+ort = "=2.0.0-rc.13"
+
+anyhow = "1.0"
+hound = "3.5"

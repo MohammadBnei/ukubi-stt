@@ -1,0 +1,37 @@
+# Gate 0 runner. Not a Deployment and not managed by ArgoCD — this is a
+# one-shot experiment that answers a yes/no question and is then deleted.
+#
+#   kubectl apply -f k8s/gate-pod.yaml
+#   kubectl logs -f stt-gate
+#   kubectl get pod stt-gate -o jsonpath='{.status.containerStatuses[0].state}'
+#   kubectl delete pod stt-gate
+#
+# A non-zero exit is the gate failing, and the message says which half broke.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stt-gate
+spec:
+  restartPolicy: Never
+  # Both halves are required and neither implies the other. Without the
+  # RuntimeClass the nvidia container runtime is not selected, so no driver is
+  # injected and nvidia-smi is not even on PATH. Without the resource limit the
+  # scheduler does not account for the GPU. ADR-0043 Decision 3.
+  runtimeClassName: nvidia
+  nodeSelector:
+    kubernetes.io/hostname: k8s-worker-01
+  containers:
+    - name: gate
+      image: registry.bnei.lan:5000/ukubi-stt:latest
+      # No argument: synthetic warmup, GPU-delta gate only. To assert a real
+      # transcript too, `kubectl cp x.wav stt-gate:/tmp/a.wav` is not possible
+      # on a Never-restart pod, so bake or mount the file and pass its path here.
+      # args: ["/tmp/a.wav"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          memory: 8Gi
+          cpu: "3"
+        requests:
+          memory: 2Gi
+          cpu: 500m

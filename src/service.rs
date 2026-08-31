@@ -90,6 +90,31 @@ impl SttService {
         }
     }
 
+    /// Load the streaming model now, in the background, so the first streaming
+    /// request does not pay for it.
+    ///
+    /// ADR-0046 Decision 2 made this lazy because "both models resident is
+    /// ~6.8GB of an 8GB card" was an ESTIMATE, and under `strategy: Recreate` a
+    /// pod that cannot start is an outage of the working batch service. It has
+    /// since been measured at 6880 MiB, so the unknown the hedge protected
+    /// against is gone.
+    ///
+    /// Warming in a background task rather than before `serve()` keeps the good
+    /// half of the hedge: the listener is already up, so a model that fails to
+    /// load costs streaming requests a FAILED_PRECONDITION and costs batch
+    /// nothing at all. The cliff it removes is real — a cold pod made the first
+    /// chunk take ~5s, and because chunks arrive faster than that backlog
+    /// drains, the first several seconds of a session ran badly behind.
+    pub async fn warm_streaming(&self) {
+        match self.handle().await {
+            Ok(_) => tracing::info!("streaming model warm"),
+            Err(e) => tracing::warn!(
+                "streaming model failed to warm ({e}); batch is unaffected and \
+                 streaming requests will retry the load"
+            ),
+        }
+    }
+
     /// The shared streaming model, loaded on first use.
     async fn handle(&self) -> Result<NemotronHandle, Status> {
         let mut guard = self.stream_handle.lock().await;
@@ -267,7 +292,13 @@ impl pb::stt_server::Stt for SttService {
                 cfg.sample_rate_hertz
             )));
         }
-        if req.audio.is_empty() {
+        // Empty audio is an error EXCEPT as a bare close. `last` means "flush
+        // and release", and a client that stops recording on an exact chunk
+        // boundary — 1 callback in 35, plus every Stop before speaking — has
+        // nothing left to send but still needs the session flushed and closed.
+        // Rejecting it leaked the recognizer until the idle sweep and dropped
+        // the tail, which is the bug the padding below exists to prevent.
+        if req.audio.is_empty() && !req.last {
             return Err(Status::invalid_argument("audio is empty"));
         }
 
@@ -287,7 +318,12 @@ impl pb::stt_server::Stt for SttService {
         tracing::info!(
             audio_seconds,
             decode_seconds,
-            rtf = decode_seconds / audio_seconds,
+            // A bare close carries no audio, and `x / 0.0` logs as `inf`.
+            rtf = if audio_seconds > 0.0 {
+                decode_seconds / audio_seconds
+            } else {
+                0.0
+            },
             chars = text.len(),
             streaming = !req.session_id.is_empty(),
             "recognize"

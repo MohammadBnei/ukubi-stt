@@ -95,16 +95,21 @@ pub fn synthetic_audio(seconds: f32) -> Vec<f32> {
 /// is wrong. Rejected rather than dropped: silently discarding it produces a
 /// transcript that is subtly wrong at the tail and no way to notice.
 pub fn pcm_s16le_to_f32(bytes: &[u8]) -> Result<Vec<f32>> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         bail!(
             "audio is {} bytes, which is not a whole number of 16-bit samples — \
              expected mono little-endian s16 PCM",
             bytes.len()
         );
     }
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+    // as_chunks over chunks_exact: the frame width is a constant, so the
+    // remainder is provably empty after the check above and from_le_bytes takes
+    // the [u8; 2] directly instead of an index pair.
+    let (frames, remainder) = bytes.as_chunks::<2>();
+    debug_assert!(remainder.is_empty(), "length was checked as even above");
+    Ok(frames
+        .iter()
+        .map(|frame| i16::from_le_bytes(*frame) as f32 / 32768.0)
         .collect())
 }
 

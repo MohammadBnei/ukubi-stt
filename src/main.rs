@@ -152,8 +152,15 @@ fn serve(model_dir: &std::path::Path, stream_dir: PathBuf) -> Result<()> {
                 }
             });
 
-            let inner = SttServer::new(service::SttService::new(model, stream_dir))
-                .max_decoding_message_size(service::MAX_DECODE_BYTES);
+            // Shared so a background task can warm the streaming model while the
+            // server is already accepting traffic. from_arc rather than new()
+            // exists for exactly this.
+            let svc = std::sync::Arc::new(service::SttService::new(model, stream_dir));
+            let warm = std::sync::Arc::clone(&svc);
+            tokio::spawn(async move { warm.warm_streaming().await });
+
+            let inner =
+                SttServer::from_arc(svc).max_decoding_message_size(service::MAX_DECODE_BYTES);
             let authed = tonic::service::interceptor::InterceptedService::new(
                 inner,
                 service::BearerAuth::new(token),

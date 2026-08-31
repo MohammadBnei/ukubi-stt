@@ -355,13 +355,37 @@ async function doSend(f32, sessionId, last) {
   }
 }
 
-function flush(last) {
+// Take EXACTLY one encoder chunk and keep the remainder.
+//
+// This used to ship the whole buffer, which was a real latency bug: the audio
+// callback delivers a fixed block at a time, so the buffer crossed 8960 at
+// 12288 samples and sent 768ms instead of 560ms. Worse, 12288 is not a multiple
+// of the encoder's chunk, so the server decoded one chunk and held the
+// remainder until the NEXT request arrived — some audio waited a whole extra
+// round for nothing. Aligning to the encoder's granularity removes both.
+function flushChunk() {
+  const merged = new Float32Array(CHUNK_SAMPLES);
+  let need = CHUNK_SAMPLES, off = 0;
+  while (need > 0) {
+    const head = state.buf[0];
+    const take = Math.min(head.length, need);
+    merged.set(head.subarray(0, take), off);
+    off += take; need -= take;
+    if (take === head.length) state.buf.shift();
+    else state.buf[0] = head.subarray(take);
+  }
+  state.buffered -= CHUNK_SAMPLES;
+  send(merged, state.session, false);
+}
+
+/// Send whatever is left and close the session. The server pads a final partial
+/// chunk with silence so the encoder flushes its tail.
+function flushTail() {
   const merged = new Float32Array(state.buffered);
   let off = 0;
   for (const b of state.buf) { merged.set(b, off); off += b.length; }
   state.buf = []; state.buffered = 0;
-  if (!merged.length && !last) return;
-  send(merged, state.session, !!last);
+  send(merged, state.session, true);
 }
 
 async function startRecording() {
@@ -377,7 +401,10 @@ async function startRecording() {
   // ponytail: ScriptProcessorNode, deprecated but universally supported and
   // about ten lines. An AudioWorklet needs a separate module file and a message
   // port to move samples across, for identical behaviour on a test page.
-  state.node = state.ctx.createScriptProcessor(4096, 1, 1);
+  // 2048 frames = 128ms per callback. 4096 doubled the jitter on the chunk
+  // boundary for no benefit — a chunk could sit up to 256ms waiting for the
+  // callback that crossed the threshold.
+  state.node = state.ctx.createScriptProcessor(2048, 1, 1);
   // One id per recording; the server keys a streaming recognizer on it and
   // sweeps it after two idle minutes if we never say `last`.
   state.session = (crypto.randomUUID && crypto.randomUUID()) ||
@@ -392,7 +419,8 @@ async function startRecording() {
     for (let i = 0; i < input.length; i += 16) peak = Math.max(peak, Math.abs(input[i]));
     $("meterbar").style.width = Math.min(100, peak * 140) + "%";
 
-    if (state.buffered >= CHUNK_SAMPLES) flush(false);
+    // A loop, not an `if`: never hold more than one chunk's worth back.
+    while (state.buffered >= CHUNK_SAMPLES) flushChunk();
   };
 
   // A ScriptProcessor only fires while connected to a destination. Routed
@@ -417,7 +445,7 @@ function stopRecording() {
   if (state.stream) { state.stream.getTracks().forEach((t) => t.stop()); state.stream = null; }
   // `last: true` releases the server-side recognizer immediately instead of
   // leaving it for the idle sweep.
-  flush(true);
+  flushTail();
   state.session = null;
   if (state.ctx) { state.ctx.close(); state.ctx = null; }
   log("stopped");

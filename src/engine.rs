@@ -191,7 +191,6 @@ pub fn load_and_assert_cuda(model_dir: &Path) -> Result<ParakeetTDT> {
     Ok(model)
 }
 
-
 /// Load the streaming model and refuse to hand back one that is secretly on CPU.
 ///
 /// LOADED LAZILY, ON FIRST STREAMING REQUEST — not at startup. ADR-0046

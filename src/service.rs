@@ -1,7 +1,9 @@
 //! The gRPC surface: one unary RPC, a bearer-token interceptor, and an
 //! unauthenticated health listener on a separate port.
 
-use crate::engine::{is_multilingual, load_streaming_and_assert_cuda, pcm_s16le_to_f32, SAMPLE_RATE};
+use crate::engine::{
+    is_multilingual, load_streaming_and_assert_cuda, pcm_s16le_to_f32, SAMPLE_RATE,
+};
 use parakeet_rs::{Nemotron, NemotronHandle, ParakeetTDT, Transcriber};
 use std::{
     collections::HashMap,
@@ -158,7 +160,11 @@ impl SttService {
                 last_used: now,
             },
         );
-        tracing::info!(session = id, sessions = map.len(), "streaming session opened");
+        tracing::info!(
+            session = id,
+            sessions = map.len(),
+            "streaming session opened"
+        );
         Ok(recognizer)
     }
 
@@ -199,10 +205,11 @@ impl SttService {
         let handle = self.handle().await?;
         let recognizer = self.session(session_id, &handle, language)?;
 
-        let text = tokio::task::spawn_blocking(move || lock(&recognizer).transcribe_chunk(&samples))
-            .await
-            .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
-            .map_err(|e| Status::internal(format!("streaming transcription failed: {e}")))?;
+        let text =
+            tokio::task::spawn_blocking(move || lock(&recognizer).transcribe_chunk(&samples))
+                .await
+                .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
+                .map_err(|e| Status::internal(format!("streaming transcription failed: {e}")))?;
 
         if last {
             let mut map = lock(&self.sessions);

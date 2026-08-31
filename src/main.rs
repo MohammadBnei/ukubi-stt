@@ -70,7 +70,10 @@ fn selftest_stream(model_dir: &std::path::Path, stream_dir: &std::path::Path) ->
     let after_both = engine::gpu_used_mib()?;
 
     println!("gpu.used empty      : {empty} MiB");
-    println!("gpu.used batch only : {after_batch} MiB (+{})", after_batch - empty);
+    println!(
+        "gpu.used batch only : {after_batch} MiB (+{})",
+        after_batch - empty
+    );
     println!(
         "gpu.used both       : {after_both} MiB (+{} for streaming)",
         after_both - after_batch

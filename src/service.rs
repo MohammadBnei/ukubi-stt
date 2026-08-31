@@ -76,13 +76,11 @@ impl pb::stt_server::Stt for SttService {
 
         // Acquire BEFORE spawning: the point is to reject the caller, not to
         // park a blocking thread waiting for the GPU.
-        let _permit = self
-            .permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted(
+        let _permit = self.permits.clone().try_acquire_owned().map_err(|_| {
+            Status::resource_exhausted(
                 "the GPU is busy with another decode — one at a time, by design. Retry.",
-            ))?;
+            )
+        })?;
 
         let model = Arc::clone(&self.model);
         let started = Instant::now();

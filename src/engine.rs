@@ -21,7 +21,10 @@
 //! (ADR-0044 Context), so crashing costs nothing that was promised.
 
 use anyhow::{bail, Context, Result};
-use parakeet_rs::{ExecutionConfig, ExecutionProvider, ParakeetTDT, Transcriber};
+use parakeet_rs::{
+    ExecutionConfig, ExecutionProvider, Nemotron, NemotronHandle, NemotronMode, ParakeetTDT,
+    Transcriber,
+};
 use std::{path::Path, process::Command, time::Instant};
 
 /// A CPU fallback allocates no GPU memory. The threshold is deliberately not
@@ -39,6 +42,12 @@ pub const SAMPLE_RATE: u32 = 16_000;
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<ParakeetTDT>();
+    // Same requirement for the streaming recognizer, which additionally lives
+    // in a map shared across requests. `NemotronHandle` is `Arc<Mutex<..>>`
+    // internally and `Clone`, so the expensive session is shared while each
+    // `Nemotron` owns ~7.5MB of independent decoder state.
+    assert_send::<Nemotron>();
+    assert_send::<NemotronHandle>();
 };
 
 /// Whole-GPU used memory in MiB, via the `nvidia-smi` the container toolkit
@@ -180,6 +189,70 @@ pub fn load_and_assert_cuda(model_dir: &Path) -> Result<ParakeetTDT> {
 
     tracing::info!("CUDA engaged ({delta} MiB resident)");
     Ok(model)
+}
+
+
+/// Load the streaming model and refuse to hand back one that is secretly on CPU.
+///
+/// LOADED LAZILY, ON FIRST STREAMING REQUEST — not at startup. ADR-0046
+/// Decision 2: both models resident is ~6.8GB of an 8GB card, and if that does
+/// not fit, loading at startup turns a bad fit into an *outage of the working
+/// batch service*, because `strategy: Recreate` has already terminated the old
+/// pod. Loading here makes the same failure one failed RPC.
+///
+/// The CUDA assertion is not skipped, only deferred. Two models means two
+/// silent-CPU-fallback surfaces, and covering only the first would quietly
+/// halve what ADR-0044 Decision 3 guarantees.
+pub fn load_streaming_and_assert_cuda(model_dir: &Path) -> Result<NemotronHandle> {
+    let baseline = gpu_used_mib()?;
+    tracing::info!("gpu.used before streaming load: {baseline} MiB");
+
+    let cfg = ExecutionConfig::new().with_execution_provider(ExecutionProvider::Cuda);
+    let t_load = Instant::now();
+    let handle = NemotronHandle::from_pretrained(model_dir, Some(cfg)).with_context(|| {
+        format!(
+            "loading the streaming model from {}. It needs exactly encoder.onnx, \
+             decoder_joint.onnx and tokenizer.model — several published ONNX exports \
+             ship decoder.onnx + joint.onnx and vocab.json instead and will not load. \
+             See ADR-0046 Decision 1.",
+            model_dir.display()
+        )
+    })?;
+    tracing::info!(
+        "streaming model loaded in {:.1}s, mode {:?}, {} samples/chunk ({:.0}ms)",
+        t_load.elapsed().as_secs_f32(),
+        handle.mode(),
+        handle.chunk_samples(),
+        handle.chunk_samples() as f32 / SAMPLE_RATE as f32 * 1000.0,
+    );
+
+    // Warm on a throwaway instance so the assertion measures the model, not the
+    // first caller's latency.
+    let mut warm = Nemotron::from_shared(&handle);
+    let chunk_seconds = handle.chunk_samples() as f32 / SAMPLE_RATE as f32;
+    warm.transcribe_chunk(&synthetic_audio(chunk_seconds))
+        .context("streaming warmup decode")?;
+
+    let after = gpu_used_mib()?;
+    let delta = after.saturating_sub(baseline);
+    tracing::info!("gpu.used after streaming load: {after} MiB (delta {delta} MiB)");
+
+    if delta < MIN_DELTA_MIB {
+        bail!(
+            "the streaming model did not engage CUDA: GPU memory grew by only {delta} MiB \
+             (< {MIN_DELTA_MIB} MiB). Read the ort=debug lines above — they name the provider \
+             that was declined. Note the batch model IS on the GPU at this point, so this is \
+             not a missing provider .so; the likeliest cause is that the card ran out of room \
+             with both models resident (~6.8GB of 8GB, ADR-0046 Decision 2)."
+        );
+    }
+    tracing::info!("streaming CUDA engaged ({delta} MiB resident)");
+    Ok(handle)
+}
+
+/// True when this build of the model can be told which language to expect.
+pub fn is_multilingual(handle: &NemotronHandle) -> bool {
+    handle.mode() == NemotronMode::Multilingual
 }
 
 #[cfg(test)]

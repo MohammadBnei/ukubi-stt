@@ -2,8 +2,9 @@
 //!
 //! Two modes, one binary:
 //!
-//!   ukubi-stt                  serve gRPC on :9090, health on :8080
-//!   ukubi-stt --selftest [wav] load the model, assert CUDA, transcribe, exit
+//!   ukubi-stt                    serve gRPC on :9090, page + health on :8080
+//!   ukubi-stt --selftest [wav]   load the batch model, assert CUDA, transcribe
+//!   ukubi-stt --selftest-stream  load BOTH models and report total GPU use
 //!
 //! `--selftest` is the Gate 0 check kept as a manual tool (ADR-0044 Decision 3).
 //! It is not a build gate and cannot be: the build-runner LXC is pinned to
@@ -39,12 +40,43 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| "/models/tdt".into())
         .into();
 
+    let stream_dir: PathBuf = std::env::var("STT_STREAM_MODEL_DIR")
+        .unwrap_or_else(|_| "/models/nemotron".into())
+        .into();
+
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("--selftest") => selftest(&model_dir, args.next().map(PathBuf::from)),
-        Some(other) => anyhow::bail!("unknown argument {other:?} — expected --selftest [wav]"),
-        None => serve(&model_dir),
+        Some("--selftest-stream") => selftest_stream(&model_dir, &stream_dir),
+        Some(other) => anyhow::bail!(
+            "unknown argument {other:?} — expected --selftest [wav] or --selftest-stream"
+        ),
+        None => serve(&model_dir, stream_dir),
     }
+}
+
+/// Load BOTH models and report what the card is holding.
+///
+/// This exists because ADR-0046 Decision 2 rests on an estimate: the batch model
+/// measures 3367 MiB live and the streaming model is an identically-sized fp32
+/// export, so both resident is *about* 6.8GB of an 8GB card. "About" is why the
+/// streaming model loads lazily in the server — and this is how to replace the
+/// estimate with a number, on the GPU node, without risking the running service.
+fn selftest_stream(model_dir: &std::path::Path, stream_dir: &std::path::Path) -> Result<()> {
+    let empty = engine::gpu_used_mib()?;
+    let _batch = engine::load_and_assert_cuda(model_dir)?;
+    let after_batch = engine::gpu_used_mib()?;
+    let _stream = engine::load_streaming_and_assert_cuda(stream_dir)?;
+    let after_both = engine::gpu_used_mib()?;
+
+    println!("gpu.used empty      : {empty} MiB");
+    println!("gpu.used batch only : {after_batch} MiB (+{})", after_batch - empty);
+    println!(
+        "gpu.used both       : {after_both} MiB (+{} for streaming)",
+        after_both - after_batch
+    );
+    println!("\nBOTH MODELS RESIDENT. If this printed, the card holds them together.");
+    Ok(())
 }
 
 /// Load, assert CUDA, transcribe, print, exit. Human-readable on purpose: this
@@ -89,7 +121,7 @@ fn selftest(model_dir: &std::path::Path, audio: Option<PathBuf>) -> Result<()> {
 /// Blocking `main` on purpose: the model loads and CUDA is asserted *before*
 /// any runtime or listener exists. There is no window in which this process is
 /// reachable but cannot decode.
-fn serve(model_dir: &std::path::Path) -> Result<()> {
+fn serve(model_dir: &std::path::Path, stream_dir: PathBuf) -> Result<()> {
     // Read before the expensive part. A missing token is a config error and
     // should not cost a 2.4GB model load and a CUDA context to discover.
     let token = std::env::var("STT_AUTH_TOKEN")
@@ -117,7 +149,7 @@ fn serve(model_dir: &std::path::Path) -> Result<()> {
                 }
             });
 
-            let inner = SttServer::new(service::SttService::new(model))
+            let inner = SttServer::new(service::SttService::new(model, stream_dir))
                 .max_decoding_message_size(service::MAX_DECODE_BYTES);
             let authed = tonic::service::interceptor::InterceptedService::new(
                 inner,

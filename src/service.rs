@@ -200,10 +200,32 @@ impl SttService {
         session_id: &str,
         language: &str,
         last: bool,
-        samples: Vec<f32>,
+        mut samples: Vec<f32>,
     ) -> Result<String, Status> {
         let handle = self.handle().await?;
         let recognizer = self.session(session_id, &handle, language)?;
+
+        // FLUSH THE TAIL. The encoder emits only on a COMPLETE chunk, so a
+        // final partial one is buffered and never decoded — measured live on
+        // 2026-08-31, where a 9.23s utterance ended "...on an NVIDIA G" and lost
+        // its last 270ms. Every utterance would lose its ending.
+        //
+        // Padding with silence to the next chunk boundary makes the buffered
+        // audio a whole chunk, and the extra full chunk after it pushes the
+        // model's right-context window past the real speech. Silence decodes to
+        // nothing, so the cost is one ~25ms decode and no spurious text.
+        //
+        // Done here rather than in the client because `last` already means
+        // exactly this, and a client that forgot would lose words with no
+        // symptom other than a slightly short transcript.
+        if last {
+            let chunk = handle.chunk_samples();
+            let remainder = samples.len() % chunk;
+            if remainder != 0 {
+                samples.resize(samples.len() + (chunk - remainder), 0.0);
+            }
+            samples.resize(samples.len() + chunk, 0.0);
+        }
 
         let text =
             tokio::task::spawn_blocking(move || lock(&recognizer).transcribe_chunk(&samples))

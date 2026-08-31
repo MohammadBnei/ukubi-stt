@@ -171,6 +171,85 @@ Not `sherpa-onnx`: its `build.rs` contains zero occurrences of `cuda` or `gpu`
 and only ever downloads the CPU tarball, so `provider: Some("cuda")` links a
 CPU-only runtime and decodes on CPU. Same class of trap, no escape hatch.
 
+## Calling it from something else
+
+Three transports, one API, one credential scheme.
+
+| caller | address | notes |
+|---|---|---|
+| another pod on ukubi-cluster | `ukubi-stt.ukubi-stt.svc.cluster.local:9090` | plaintext h2c — no TLS, no Traefik, ~1ms of network |
+| a machine on LAN/WAN | `stt.bnei.dev:443` | TLS, native gRPC |
+| a browser | `https://stt.bnei.dev` | gRPC-Web; `web/index.html` is a working reference client |
+
+**In-cluster is the one to use if you have the choice.** It skips TLS, the
+ingress and the gRPC-Web translation, and it is the same API.
+
+### Discovering the API
+
+Reflection is enabled, so nothing needs a vendored `.proto`:
+
+```bash
+grpcurl -plaintext ukubi-stt:9090 list
+grpcurl -plaintext ukubi-stt:9090 describe stt.v1.Stt.Recognize
+```
+
+**In-cluster only, by construction.** The IngressRoute matches
+`PathPrefix(/stt.v1.Stt/)`; reflection answers on `/grpc.reflection.v1.*`, so
+Traefik 404s it from outside. External callers still need the proto — it is in
+`proto/stt/v1/stt.proto` in this repo.
+
+### Credentials
+
+Every call carries `authorization: Bearer <token>`. Each caller gets its own:
+
+```
+STT_TOKEN_<NAME>   one per caller, e.g. STT_TOKEN_FLEET, STT_TOKEN_BROWSER
+STT_AUTH_TOKEN     the original, still accepted, reported as client "default"
+```
+
+They live in Infisical (`ukubi-stt-bhr-m`) and reach the pod through
+`common-app-chart`'s `infisical` block, which passes the whole project as env
+vars — so **adding a caller is adding a secret, and revoking one is deleting
+it**. No redeploy, no code change, and revoking one caller does not revoke the
+others. The matched name is logged with every request.
+
+A consumer in a different Infisical project should be granted read on this one
+rather than given a copy of the value; two copies means two things to rotate.
+
+### Making a call
+
+```bash
+grpcurl -plaintext -H "authorization: Bearer $TOKEN" \
+  -d '{"config":{"sampleRateHertz":16000},"audio":"<base64 PCM>"}' \
+  ukubi-stt:9090 stt.v1.Stt/Recognize
+```
+
+Audio is **16 kHz mono little-endian s16 PCM**, raw — no container, no encoding
+field. Anything else is rejected rather than resampled, because a silently
+resampled request returns a plausible transcript and a meaningless real-time
+factor.
+
+Leave `session_id` empty for a one-shot decode of a whole utterance. Set it (and
+send ~560ms chunks in order, `last: true` on the final one) for realtime — see
+ADR-0046.
+
+### Two things to design around
+
+**One batch decode at a time, cluster-wide.** The offline path holds a
+`Semaphore(1)` and a second caller gets `RESOURCE_EXHAUSTED` *immediately* —
+there is no queue, deliberately, because a queue on a single GPU turns overload
+into unbounded latency. **Callers need retry with backoff.** Streaming is
+different: eight concurrent sessions, since each occupies the GPU for only
+20-50ms per 560ms chunk.
+
+**This service is best-effort and will disappear.** Single replica, pinned to
+the one node with a GPU, no HA and no CPU fallback — all deliberate (ADR-0044
+Context), including that `.165` reboots for gaming and takes STT with it.
+**Treat `UNAVAILABLE` as normal and degrade**; do not build something whose
+correctness depends on STT answering. If a consumer ever genuinely needs uptime,
+that reopens ADR-0044's availability decision rather than being worked around in
+the client.
+
 ## Models
 
 | | Repo | Files |

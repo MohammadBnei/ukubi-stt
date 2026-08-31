@@ -33,6 +33,12 @@ tonic = "0.14"
 # tonic 0.14 moved prost codec support into its own crate. The generated module
 # references tonic_prost::ProstCodec, so this is not optional.
 tonic-prost = "0.14"
+# Serves the descriptor set build.rs emits, so any client can discover the API
+# without a vendored .proto. Deliberately NOT reachable from outside: the
+# IngressRoute matches PathPrefix(`/stt.v1.Stt/`) and reflection answers on
+# `/grpc.reflection.v1.*`, so Traefik 404s it. In-cluster callers get it, the
+# internet does not.
+tonic-reflection = "0.14"
 prost = "0.14"
 axum = "0.8"
 

@@ -21,8 +21,15 @@ ARG UBUNTU_VERSION=ubuntu22.04
 #     has them and -runtime does not.
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-${UBUNTU_VERSION} AS build
 
+# libssl-dev is required and its absence is not obvious: something in the
+# parakeet-rs/ort tree pulls openssl-sys, whose build script fails with
+# "Package openssl was not found in the pkg-config search path". GitHub's
+# ubuntu-latest runners ship libssl-dev preinstalled, so `cargo clippy` in
+# ci.yml passes without it — the CUDA base image does not, which is exactly
+# the kind of gap a hosted CI check cannot catch for you.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential curl ca-certificates pkg-config \
+ && apt-get install -y --no-install-recommends \
+      build-essential curl ca-certificates pkg-config libssl-dev \
  && rm -rf /var/lib/apt/lists/*
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --default-toolchain stable --profile minimal

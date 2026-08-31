@@ -1,0 +1,212 @@
+# ukubi-stt — ArgoCD values for common-app-chart. ADR-0044 (the service),
+# ADR-0045 (what is in the image and what is on the node).
+#
+# Read by gitops/apps/registry.yaml + gitops/bootstrap/apps.applicationset.yaml
+# in infra-bootstrap, which must stay in sync (CI enforces it).
+
+image:
+  repository: registry.bnei.lan:5000/ukubi-stt
+  tag: "0.3.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# MANDATORY, not a preference. RollingUpdate defaults to maxSurge 1 /
+# maxUnavailable 0: the new pod requests the only `nvidia.com/gpu` while the old
+# pod still holds it, so it stays Pending forever and the rollout wedges
+# permanently. The first thing that would trip it is an Infisical `autoReload`
+# token rotation — i.e. the failure would arrive months later, attached to an
+# unrelated action.
+strategy:
+  type: Recreate
+
+# Both halves are required and neither implies the other. Without the
+# RuntimeClass the nvidia container runtime is not selected, so no driver is
+# injected and the process cannot even find nvidia-smi. Without the resource
+# limit the scheduler does not account for the GPU. ADR-0043 Decisions 2/3.
+runtimeClassName: nvidia
+nodeSelector:
+  kubernetes.io/hostname: k8s-worker-01
+
+service:
+  # /healthz and /livez. Never routed externally — only :9090 gets a route.
+  port: 8080
+  extraPorts:
+    - name: grpc
+      port: 9090
+
+# The chart's own IngressRoute cannot emit `scheme: h2c`, which a gRPC backend
+# requires, so the route is hand-written below. Do NOT flip this back on: two
+# IngressRoutes with the same Host() on the same entrypoint is nondeterministic
+# routing, not a fallback.
+#
+# Consequence to remember: with this false, templates/middleware.yaml renders
+# NOTHING, so the ADR-0038 baseline chain does not exist for this app. Both
+# middlewares below are hand-written replacements for it, not extras.
+ingress:
+  enabled: false
+
+# DEFAULT IS true, and its max of {cpu: 2, memory: 4Gi} is an ADMISSION-TIME
+# rejection — the pod would never be created. A CUDA + cuDNN + ORT process with
+# a resident 1.1GB model has no headroom under 4Gi. The chart's own values
+# comment names this exact case.
+limitRange:
+  enabled: false
+
+# The model weights, on node-local storage rather than in the image. ADR-0045
+# Decision 1.
+#
+# `local-path`, deliberately not the `longhorn` default: three replicas of a
+# re-downloadable third-party file is 7.2GB of replicated storage protecting
+# data whose recovery procedure is `curl`. This workload is already pinned to
+# one node with no HA, so a node-pinned volume loses nothing that was promised.
+#
+# 8Gi against ~2.4GB today. The headroom is for Phase E's second (streaming)
+# model, which lands in the same volume. Note this shares k8s-worker-01's OS
+# disk with agent-fleet's session volumes.
+persistence:
+  enabled: true
+  size: 8Gi
+  storageClass: local-path
+  mountPath: /models
+  accessMode: ReadWriteOnce
+
+# Fetches the weights when the volume is empty, which makes the PVC a cache
+# rather than a dependency: a rebuilt node costs one download, not a broken
+# deployment.
+#
+# Runs the app's OWN image — it already carries curl and is already on the node,
+# so this costs no extra pull and adds no upstream dependency. The tag is
+# interpolated rather than hardcoded; a literal here would silently drift from
+# image.tag on every bump and fetch with a stale script.
+initContainers:
+  - name: fetch-model
+    image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+    imagePullPolicy: IfNotPresent
+    command: ["/usr/local/bin/fetch-model.sh"]
+    env:
+      - name: STT_MODEL_DIR
+        value: /models/tdt
+    volumeMounts:
+      - name: data
+        mountPath: /models
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {cpu: "1", memory: 512Mi}
+
+env:
+  - name: STT_MODEL_DIR
+    value: /models/tdt
+
+# STT_AUTH_TOKEN. The process refuses to start without it rather than serving a
+# GPU on a hostname that Certificate Transparency publishes minutes after
+# issuance (ADR-0044 Consequences).
+#
+# autoReload restarts the pod when the token rotates — which is exactly why
+# `strategy: Recreate` above is mandatory, and why a browser client MUST ship a
+# 401 handler that clears localStorage and re-prompts. Without one, rotation is
+# an outage nobody diagnoses.
+infisical:
+  enabled: true
+  projectSlug: ukubi-stt-bhr-m
+  autoReload: true
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    cpu: "3"
+    memory: 8Gi
+    nvidia.com/gpu: 1
+
+# Both default to enabled:false in the chart — probes here are not decorative.
+# There is no startupProbe in this chart (zero occurrences), and a CUDA model
+# load plus warmup is exactly what a short liveness delay kills in a loop.
+# Hence 120s: the init container's download is separate and does not count
+# against it, but the load, the CUDA context and the warmup decode do.
+livenessProbe:
+  enabled: true
+  path: /livez
+  initialDelaySeconds: 120
+  periodSeconds: 15
+  failureThreshold: 4
+readinessProbe:
+  enabled: true
+  path: /healthz
+  initialDelaySeconds: 10
+  periodSeconds: 5
+
+# Hand-written because `ingress.enabled: false` renders none of the chart's own.
+#
+# NOT YET HERE, deliberately: the `grpcWeb` middleware and its CORS `headers`
+# companion. They exist only to serve a browser, there is no browser client
+# yet, and `grpcWeb` exposes exactly one property (`allowOrigins`) — CORS lives
+# on a separate `headers` middleware and every browser call is preflighted
+# because it carries `authorization`. Both land with the client, when the origin
+# is a known value rather than a guess.
+extraManifests:
+  - |
+    # Abuse protection on a hostname with no WAF in front of it. Grey-cloud
+    # (ADR-0044 Decision 6) means no Cloudflare, so this and Semaphore(1) in the
+    # server are the only limits that exist.
+    #
+    # sourceCriterion is deliberately ABSENT. The baseline sets
+    # requestHeaderName: CF-Connecting-IP because *.bnei.dev is proxied — but
+    # that header does not exist on a direct connection, and bucketing on an
+    # absent header collapses every caller on earth into one empty-key bucket.
+    # Omitting it makes Traefik bucket on the real TCP peer, which here IS the
+    # client. ADR-0038.
+    apiVersion: traefik.io/v1alpha1
+    kind: Middleware
+    metadata:
+      name: {{ .Release.Name }}-ratelimit
+      namespace: {{ .Release.Namespace }}
+    spec:
+      rateLimit:
+        average: 100
+        burst: 200
+        period: 1s
+  - |
+    # The ADR-0038 baseline security headers, reproduced by hand because
+    # ingress.enabled: false means the chart renders none. HSTS without
+    # includeSubDomains and without preload, for the same reason the baseline
+    # gives: those are the parts that are genuinely hard to undo.
+    apiVersion: traefik.io/v1alpha1
+    kind: Middleware
+    metadata:
+      name: {{ .Release.Name }}-headers
+      namespace: {{ .Release.Namespace }}
+    spec:
+      headers:
+        contentTypeNosniff: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        stsSeconds: 31536000
+  - |
+    # `scheme: h2c` is the whole reason this is hand-written: a gRPC backend
+    # speaks HTTP/2 cleartext, and the chart's IngressRoute template cannot emit
+    # it. The field is an unconstrained string with no enum, so a typo passes
+    # admission and fails at Traefik — verify after deploy, do not trust the
+    # apply.
+    apiVersion: traefik.io/v1alpha1
+    kind: IngressRoute
+    metadata:
+      name: {{ .Release.Name }}
+      namespace: {{ .Release.Namespace }}
+    spec:
+      entryPoints:
+        - websecure
+      routes:
+        - kind: Rule
+          match: Host(`stt.bnei.dev`)
+          middlewares:
+            - name: {{ .Release.Name }}-ratelimit
+              namespace: {{ .Release.Namespace }}
+            - name: {{ .Release.Name }}-headers
+              namespace: {{ .Release.Namespace }}
+          services:
+            - name: {{ .Release.Name }}
+              port: 9090
+              scheme: h2c
+      tls:
+        certResolver: le

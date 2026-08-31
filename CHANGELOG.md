@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/MohammadBnei/ukubi-stt/compare/0.5.2...0.5.3) (2026-08-31)
+
+
+### Performance Improvements
+
+* **web:** AudioWorklet instead of ScriptProcessor, and chunk in the worklet ([#10](https://github.com/MohammadBnei/ukubi-stt/issues/10)) ([78147cc](https://github.com/MohammadBnei/ukubi-stt/commit/78147cce3562e7f92f7e910fbce8d084bf2a37c5))
+
 ## [0.5.2](https://github.com/MohammadBnei/ukubi-stt/compare/0.5.1...0.5.2) (2026-08-31)
 
 

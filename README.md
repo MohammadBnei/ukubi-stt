@@ -24,6 +24,10 @@ the proto is deliberately not written yet either.
 and warmup, decode, report a real-time factor, and **exit non-zero if the GPU
 was never touched**.
 
+It compiles, is clippy-clean under `-D warnings`, and its two unit tests pass
+in CI. That says nothing about whether CUDA engages — no hosted runner has an
+RTX 2070 — which is precisely what the gate is for.
+
 ### Why that assertion is not paranoia
 
 `parakeet-rs` registers execution providers like this (`execution.rs`, 0.3.7):
@@ -80,10 +84,14 @@ A delta under 128 MiB is a failure regardless of how good the transcript looks.
    driver is not the constraint — the ORT build is. Failure at *session
    creation* rather than at the memory assertion points here.
 2. **Whether `ort` can find its CUDA libraries at runtime.** May need the
-   `load-dynamic` feature or `ORT_DYLIB_PATH`.
+   `load-dynamic` feature or `ORT_DYLIB_PATH`. Note this is a *runtime*
+   question and remains open — CI settled only the build half: `ort` with
+   `parakeet-rs/cuda` compiles fine on a GitHub runner with no CUDA toolkit
+   installed, so nothing about the CUDA path blocks a plain `cargo build`.
 3. **Whether `ParakeetTDT` is `Send`.** Not needed for this single-threaded
    binary, but the gRPC server's design depends on it — if it is not, the model
-   needs a dedicated thread and a channel rather than a mutex.
+   needs a dedicated thread and a channel rather than a mutex. Compiling this
+   binary does not exercise it.
 
 ## If the gate fails
 

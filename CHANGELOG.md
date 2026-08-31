@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/MohammadBnei/ukubi-stt/compare/0.5.0...0.5.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* **streaming:** flush the tail, or every utterance loses its ending ([#8](https://github.com/MohammadBnei/ukubi-stt/issues/8)) ([6a5d3d3](https://github.com/MohammadBnei/ukubi-stt/commit/6a5d3d3cdc03a0586e1b01ecd5326c109951a74f))
+
 # [0.5.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.4.0...0.5.0) (2026-08-31)
 
 

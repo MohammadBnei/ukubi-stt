@@ -3,9 +3,14 @@
 # should not cost that. This runs on every PR and push, on a GitHub-hosted
 # runner, with no GPU involved.
 #
-# It cannot prove CUDA engages — that is Gate 0's job on real hardware, and no
-# hosted runner has an RTX 2070. It proves the code compiles, is formatted, is
-# clippy-clean and its pure helpers behave.
+# It cannot prove CUDA engages — that is the startup assertion's job on real
+# hardware, and no hosted runner has an RTX 2070. It proves the code compiles,
+# is formatted, is clippy-clean and its pure helpers behave.
+#
+# Gate 0 PASSED on 2026-08-31 (3487 MiB resident, RTF 0.006), so the engine
+# question is settled. What CI still cannot see is the runtime image: the
+# failure that cost a day was a missing .so and a CUDA major mismatch, neither
+# of which a `cargo clippy` on a hosted runner can reach.
 name: ci
 
 on:
@@ -25,6 +30,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # tonic-prost-build shells out to protoc, so build.rs fails without it.
+      # ubuntu-latest does not ship it. The Dockerfile installs the same
+      # package; keep the two in step.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
 
       # Caches ~/.cargo and target/. The parakeet-rs -> ort -> ndarray/tokenizers
       # tree is the slow part and it changes only when Cargo.toml does.
@@ -57,6 +68,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       # Advisory-only, and deliberately not blocking: this depends on an ort

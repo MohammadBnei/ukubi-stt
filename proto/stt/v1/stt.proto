@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package stt.v1;
+
+// GPU speech-to-text. ADR-0044.
+//
+// Phase 1 is ONE unary RPC, deliberately. Browsers cannot do gRPC client- or
+// bidirectional streaming — gRPC-Web and Connect give unary and
+// server-streaming only, and `duplex: 'full'` fetch ships in no stable browser
+// as of 2026. So realtime is chunked unary at utterance granularity: one
+// transport, one auth path, no partials.
+//
+// StreamingRecognize is NOT declared here. Adding an RPC later is a
+// backward-compatible proto change; getting a message's field numbers wrong is
+// not. An RPC that exists and returns UNIMPLEMENTED is scaffolding pretending
+// to be an interface.
+service Stt {
+  rpc Recognize(RecognizeRequest) returns (RecognizeResponse);
+}
+
+message RecognitionConfig {
+  // 16000 only. The model is 16 kHz mono; anything else is rejected rather
+  // than resampled, because a silently resampled request returns a plausible
+  // transcript and a meaningless real-time factor.
+  int32 sample_rate_hertz = 1;
+
+  // Parakeet TDT v3 auto-detects across its 25 languages, so this is accepted
+  // and unused today. It becomes the routing key when a second model lands for
+  // Persian/Arabic (ADR-0044 Consequences) — which is why it is in the wire
+  // format now, when it is free, rather than later, when it is a migration.
+  string language = 2;
+}
+
+message RecognizeRequest {
+  RecognitionConfig config = 1;
+
+  // Mono little-endian signed 16-bit PCM. No container, no encoding enum —
+  // the caller has already decided what it is sending, and a format field
+  // whose only legal value is one thing is a field that lies.
+  //
+  // Capped at 16 MB by max_decoding_message_size (~8 minutes at 16 kHz).
+  bytes audio = 2;
+
+  // Reserved for Phase E's chunk stitching: session_id, offset_ms, last.
+  // Held now so those fields get these numbers when they are actually
+  // honoured. A field the server accepts and ignores is worse than an absent
+  // one — the client cannot tell the difference.
+  reserved 3, 4, 5;
+  reserved "session_id", "offset_ms", "last";
+}
+
+message RecognizeResponse {
+  string text = 1;
+
+  // These two exist so any client can compute the real-time factor itself.
+  // The failure this service is most prone to is decoding correctly on the
+  // wrong device, which looks like success in every way except speed — so the
+  // number that reveals it is part of the contract, not a debug log.
+  float audio_seconds = 2;
+  float decode_seconds = 3;
+}

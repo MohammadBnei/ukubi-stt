@@ -72,7 +72,11 @@ limitRange:
 # disk with agent-fleet's session volumes.
 persistence:
   enabled: true
-  size: 8Gi
+  # Two models now: TDT 2.49GB + Nemotron 2.59GB = ~5.1GB (ADR-0046). Note
+  # local-path does not enforce quotas, so this claim is advisory — the real
+  # constraint is k8s-worker-01's OS disk, shared with agent-fleet's session
+  # volumes.
+  size: 12Gi
   storageClass: local-path
   mountPath: /models
   accessMode: ReadWriteOnce
@@ -93,6 +97,8 @@ initContainers:
     env:
       - name: STT_MODEL_DIR
         value: /models/tdt
+      - name: STT_STREAM_MODEL_DIR
+        value: /models/nemotron
     volumeMounts:
       - name: data
         mountPath: /models
@@ -103,6 +109,12 @@ initContainers:
 env:
   - name: STT_MODEL_DIR
     value: /models/tdt
+  # The streaming model. Loaded lazily on the first streaming request rather
+  # than at startup: both models resident is ~6.8GB of an 8GB card, and with
+  # `strategy: Recreate` a pod that cannot start is an outage of the working
+  # batch service rather than a failed upgrade. ADR-0046 Decision 2.
+  - name: STT_STREAM_MODEL_DIR
+    value: /models/nemotron
 
 # STT_AUTH_TOKEN. The process refuses to start without it rather than serving a
 # GPU on a hostname that Certificate Transparency publishes minutes after

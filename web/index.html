@@ -74,7 +74,7 @@
 
 <main>
   <h1>ukubi-stt</h1>
-  <p class="sub">Parakeet TDT 0.6B on an RTX 2070 SUPER, one decode at a time.</p>
+  <p class="sub">Parakeet TDT for files, Nemotron 3.5 streaming for the mic. One RTX 2070 SUPER.</p>
 
   <div class="card" id="authcard">
     <label for="token">Bearer token</label>
@@ -95,9 +95,11 @@
       <input type="file" id="file" accept="audio/*,.wav" class="hidden">
     </div>
     <div id="meter"><div id="meterbar"></div></div>
-    <p class="hint">Audio is sent in <span id="chunklen">4</span>-second chunks as separate unary
-      calls. Browsers cannot do gRPC client-streaming, so a word can land on a chunk boundary —
-      server-side stitching is Phase E, and the proto already reserves the field numbers for it.</p>
+    <p class="hint"><b>Record</b> streams: <span id="chunklen">560</span>ms chunks carrying a
+      session id, decoded by a model that keeps its encoder state between them, so text appears
+      about half a second behind you. <b>Send a WAV</b> goes as one offline decode against the
+      batch model, which sees the whole utterance and is more accurate — streaming trades some of
+      that for latency, and a file does not need the trade.</p>
   </div>
 
   <div class="card hidden" id="out">
@@ -122,12 +124,21 @@
 "use strict";
 
 const SAMPLE_RATE = 16000;
-const CHUNK_SECONDS = 4;
+// The streaming encoder runs at 560ms granularity (8960 samples at 16kHz), so
+// that is the natural send size: smaller chunks add requests without lowering
+// latency, larger ones add latency without saving anything meaningful.
+const CHUNK_SAMPLES = 8960;
+const CHUNK_SECONDS = CHUNK_SAMPLES / SAMPLE_RATE;
 const METHOD = "/stt.v1.Stt/Recognize";
 
 const $ = (id) => document.getElementById(id);
 const state = { recording: false, ctx: null, stream: null, node: null, buf: [], buffered: 0,
-                audio: 0, decode: 0, chunks: 0, busy: false };
+                audio: 0, decode: 0, chunks: 0, session: null, queued: 0,
+                // Chunks MUST reach the server in order: the streaming encoder
+                // carries cache forward, so a reordered or dropped chunk
+                // corrupts everything after it. A promise chain is the whole
+                // mechanism — one in flight at a time, strictly sequential.
+                chain: Promise.resolve() };
 
 function log(msg, cls) {
   const d = document.createElement("div");
@@ -152,11 +163,18 @@ function lenDelimited(fieldNo, bytes) {
   return [((fieldNo << 3) | 2), ...varint(bytes.length), ...bytes];
 }
 
-// RecognizeRequest { RecognitionConfig config = 1; bytes audio = 2; }
-// RecognitionConfig { int32 sample_rate_hertz = 1; }
-function encodeRequest(pcm) {
+// RecognizeRequest {
+//   RecognitionConfig config = 1; bytes audio = 2; string session_id = 3;
+//   reserved 4; bool last = 5;
+// }
+// An empty session_id means a one-shot offline decode against the batch model;
+// a non-empty one continues a server-side streaming recognizer.
+function encodeRequest(pcm, sessionId, last) {
   const config = [(1 << 3) | 0, ...varint(SAMPLE_RATE)];
-  const head = new Uint8Array([...lenDelimited(1, config), ((2 << 3) | 2), ...varint(pcm.length)]);
+  let head = [...lenDelimited(1, config)];
+  if (sessionId) head.push(...lenDelimited(3, new TextEncoder().encode(sessionId)));
+  if (last) head.push((5 << 3) | 0, 1);          // proto3 omits false; so do we
+  head.push((2 << 3) | 2, ...varint(pcm.length)); // audio last, it is the bulk
   const out = new Uint8Array(head.length + pcm.length);
   out.set(head, 0);
   out.set(pcm, head.length);
@@ -200,8 +218,8 @@ function decodeResponse(bytes) {
 const GRPC_CODES = { 3: "INVALID_ARGUMENT", 8: "RESOURCE_EXHAUSTED", 12: "UNIMPLEMENTED",
                      13: "INTERNAL", 14: "UNAVAILABLE", 16: "UNAUTHENTICATED" };
 
-async function recognize(pcm, token) {
-  const body = encodeRequest(pcm);
+async function recognize(pcm, token, sessionId, last) {
+  const body = encodeRequest(pcm, sessionId, last);
   const framed = new Uint8Array(5 + body.length);
   framed[0] = 0x00;
   new DataView(framed.buffer).setUint32(1, body.length, false);
@@ -287,15 +305,23 @@ function toPCM16(f32) {
   return out;
 }
 
-async function send(f32) {
-  if (!f32.length) return;
-  // Semaphore(1) server-side: a second concurrent call gets RESOURCE_EXHAUSTED
-  // rather than queued. Serialising here means we never provoke it.
-  if (state.busy) { log("previous chunk still decoding, dropping this one", "warn"); return; }
-  state.busy = true;
+// Enqueue rather than drop. The previous version dropped a chunk when one was
+// already in flight, which is survivable for independent offline chunks and
+// corrupting for a stream. Decode is ~20-50ms per 560ms of audio, so the queue
+// drains an order of magnitude faster than it fills.
+function send(f32, sessionId, last) {
+  if (!f32.length && !last) return state.chain;
+  state.queued += 1;
+  state.chain = state.chain.then(() => doSend(f32, sessionId, last)).finally(() => {
+    state.queued -= 1;
+  });
+  return state.chain;
+}
+
+async function doSend(f32, sessionId, last) {
   try {
     const started = performance.now();
-    const r = await recognize(toPCM16(f32), getToken());
+    const r = await recognize(toPCM16(f32), getToken(), sessionId, last);
     const rtt = (performance.now() - started) / 1000;
 
     if (r.text.trim()) {
@@ -321,22 +347,21 @@ async function send(f32) {
         'x faster than realtime.</span>';
     }
     log("chunk " + state.chunks + ": " + r.audio_seconds.toFixed(2) + "s audio, " +
-        r.decode_seconds.toFixed(3) + "s decode, " + rtt.toFixed(2) + "s round trip", "ok");
+        r.decode_seconds.toFixed(3) + "s decode, " + rtt.toFixed(2) + "s round trip" +
+        (state.queued > 1 ? "  (" + (state.queued - 1) + " queued)" : ""), "ok");
   } catch (e) {
     if (e.grpcCode === 16) onUnauthenticated();
     else log(e.message, "err");
-  } finally {
-    state.busy = false;
   }
 }
 
-function flush() {
-  if (!state.buffered) return;
+function flush(last) {
   const merged = new Float32Array(state.buffered);
   let off = 0;
   for (const b of state.buf) { merged.set(b, off); off += b.length; }
   state.buf = []; state.buffered = 0;
-  send(merged);
+  if (!merged.length && !last) return;
+  send(merged, state.session, !!last);
 }
 
 async function startRecording() {
@@ -353,7 +378,10 @@ async function startRecording() {
   // about ten lines. An AudioWorklet needs a separate module file and a message
   // port to move samples across, for identical behaviour on a test page.
   state.node = state.ctx.createScriptProcessor(4096, 1, 1);
-  const chunkSamples = SAMPLE_RATE * CHUNK_SECONDS;
+  // One id per recording; the server keys a streaming recognizer on it and
+  // sweeps it after two idle minutes if we never say `last`.
+  state.session = (crypto.randomUUID && crypto.randomUUID()) ||
+                  String(Date.now()) + Math.random().toString(36).slice(2);
 
   state.node.onaudioprocess = (e) => {
     const input = e.inputBuffer.getChannelData(0);
@@ -364,7 +392,7 @@ async function startRecording() {
     for (let i = 0; i < input.length; i += 16) peak = Math.max(peak, Math.abs(input[i]));
     $("meterbar").style.width = Math.min(100, peak * 140) + "%";
 
-    if (state.buffered >= chunkSamples) flush();
+    if (state.buffered >= CHUNK_SAMPLES) flush(false);
   };
 
   // A ScriptProcessor only fires while connected to a destination. Routed
@@ -377,7 +405,8 @@ async function startRecording() {
 
   state.recording = true;
   $("rec").textContent = "Stop";
-  log("recording at " + state.ctx.sampleRate + " Hz, " + CHUNK_SECONDS + "s chunks");
+  log("recording at " + state.ctx.sampleRate + " Hz, streaming in " +
+      Math.round(CHUNK_SECONDS * 1000) + "ms chunks, session " + state.session.slice(0, 8));
 }
 
 function stopRecording() {
@@ -386,7 +415,10 @@ function stopRecording() {
   $("meterbar").style.width = "0%";
   if (state.node) { state.node.disconnect(); state.node.onaudioprocess = null; state.node = null; }
   if (state.stream) { state.stream.getTracks().forEach((t) => t.stop()); state.stream = null; }
-  flush();
+  // `last: true` releases the server-side recognizer immediately instead of
+  // leaving it for the idle sweep.
+  flush(true);
+  state.session = null;
   if (state.ctx) { state.ctx.close(); state.ctx = null; }
   log("stopped");
 }
@@ -410,11 +442,17 @@ async function sendFile(file) {
   const rendered = await off.startRendering();
   const samples = rendered.getChannelData(0);
 
-  log(file.name + ": " + decoded.duration.toFixed(2) + "s, sending in " + CHUNK_SECONDS + "s chunks");
-  const chunk = SAMPLE_RATE * CHUNK_SECONDS;
-  for (let i = 0; i < samples.length; i += chunk) {
-    await send(samples.slice(i, Math.min(i + chunk, samples.length)));
+  // A whole file goes as ONE offline request against the batch model, not as
+  // streamed chunks. The offline model sees the entire utterance and is more
+  // accurate for it; streaming exists to trade some of that for latency, which
+  // a file does not need. 16MB cap server-side is ~8 minutes.
+  const minutes = decoded.duration / 60;
+  if (decoded.duration * 2 > 16 * 1024 * 1024) {
+    log(`${file.name} is ${minutes.toFixed(1)} min — over the ~8 min request cap`, "err");
+    return;
   }
+  log(file.name + ": " + decoded.duration.toFixed(2) + "s, one offline decode");
+  await send(samples, "", false);
 }
 
 /* ------------------------------------------------------------------ wiring */
@@ -451,7 +489,7 @@ $("clear").onclick = () => {
   $("rtfnote").textContent = "";
 };
 
-$("chunklen").textContent = CHUNK_SECONDS;
+$("chunklen").textContent = Math.round(CHUNK_SECONDS * 1000);
 $("token").value = getToken();
 reflectAuth();
 log("ready" + (getToken() ? "" : " — enter the bearer token to start"));

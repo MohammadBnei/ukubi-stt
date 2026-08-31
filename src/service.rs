@@ -1,12 +1,16 @@
 //! The gRPC surface: one unary RPC, a bearer-token interceptor, and an
 //! unauthenticated health listener on a separate port.
 
-use crate::engine::{pcm_s16le_to_f32, SAMPLE_RATE};
-use parakeet_rs::{ParakeetTDT, Transcriber};
+use crate::engine::{
+    is_multilingual, load_streaming_and_assert_cuda, pcm_s16le_to_f32, SAMPLE_RATE,
+};
+use parakeet_rs::{Nemotron, NemotronHandle, ParakeetTDT, Transcriber};
 use std::{
+    collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Instant,
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tonic::{service::Interceptor, Request, Response, Status};
@@ -21,27 +25,202 @@ pub mod pb {
 /// no Cloudflare WAF in front of it, so the body cap is ours to set.
 pub const MAX_DECODE_BYTES: usize = 16 * 1024 * 1024;
 
-/// One decode at a time. One 8 GB GPU running one model is honest about what it
-/// can do, and it doubles as abuse protection on a hostname that Certificate
-/// Transparency publishes within minutes of issuance.
+/// A cap on concurrent streaming sessions. The binding constraint is not the
+/// ~7.5MB of decoder state each one holds — it is the GPU, which each stream
+/// occupies for 20-50ms out of every 560ms. Eight streams is roughly half the
+/// card's duty cycle, with the batch path still needing room.
+const MAX_SESSIONS: usize = 8;
+
+/// Sessions idle longer than this are swept. Browsers close tabs without
+/// sending `last: true`, and that is the normal case rather than the edge — an
+/// unbounded map keyed by a client-supplied string is a memory leak with an
+/// attacker-chosen key. ADR-0046 Decision 5.
+const SESSION_IDLE: Duration = Duration::from_secs(120);
+
+struct Session {
+    recognizer: Arc<Mutex<Nemotron>>,
+    last_used: Instant,
+}
+
+/// Recover rather than propagate a poisoned mutex.
 ///
-/// ponytail: `try_acquire` and reject, never queue. A queue on a single GPU
-/// converts overload into unbounded latency, which is harder to diagnose than a
-/// clean RESOURCE_EXHAUSTED. Phase E's streaming needs a different shape
-/// entirely — a shared recognizer with per-session streams — because holding
-/// this permit for a stream's lifetime would let one browser tab starve every
-/// batch caller.
+/// A decode that panicked poisons its lock. Refusing to touch it afterwards
+/// means one bad request bricks the service until someone notices a pod that is
+/// Ready and answers every call with the same panic.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("mutex was poisoned by a previous panic; recovering");
+        poisoned.into_inner()
+    })
+}
+
+/// Two recognizers behind one RPC, with deliberately different concurrency.
+///
+/// **Offline** (`session_id` empty) keeps one decode at a time behind a
+/// `Semaphore(1)`. One 8GB GPU running one model is honest about what it can do,
+/// and a batch caller submitting eight minutes of audio *should* be serialised.
+///
+/// **Streaming** (`session_id` set) must not use that permit, and ADR-0044
+/// Decision 4 predicted why: holding a single permit for a stream's lifetime
+/// lets one browser tab starve every batch caller, and the rate limiter cannot
+/// help because the connection is already established. Instead each session
+/// gets its own recognizer over a shared ONNX session, and the model's internal
+/// lock is held only during inference — 20-50ms per 560ms chunk.
 pub struct SttService {
     model: Arc<Mutex<ParakeetTDT>>,
     permits: Arc<tokio::sync::Semaphore>,
+    stream_dir: PathBuf,
+    /// `None` until the first streaming request. See
+    /// [`crate::engine::load_streaming_and_assert_cuda`] for why this is lazy.
+    /// A `tokio` mutex rather than a `std` one because it is held across the
+    /// load `await` — which also means concurrent first-requests wait on one
+    /// load instead of racing to start several.
+    stream_handle: Arc<tokio::sync::Mutex<Option<NemotronHandle>>>,
+    sessions: Arc<Mutex<HashMap<String, Session>>>,
 }
 
 impl SttService {
-    pub fn new(model: ParakeetTDT) -> Self {
+    pub fn new(model: ParakeetTDT, stream_dir: PathBuf) -> Self {
         Self {
             model: Arc::new(Mutex::new(model)),
             permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            stream_dir,
+            stream_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The shared streaming model, loaded on first use.
+    async fn handle(&self) -> Result<NemotronHandle, Status> {
+        let mut guard = self.stream_handle.lock().await;
+        if let Some(h) = guard.as_ref() {
+            return Ok(h.clone());
+        }
+        let dir = self.stream_dir.clone();
+        let handle = tokio::task::spawn_blocking(move || load_streaming_and_assert_cuda(&dir))
+            .await
+            .map_err(|e| Status::internal(format!("streaming model load task failed: {e}")))?
+            // failed_precondition, not internal: either the model is missing or
+            // the card could not hold both, and neither is fixed by retrying.
+            .map_err(|e| Status::failed_precondition(format!("{e:#}")))?;
+        *guard = Some(handle.clone());
+        Ok(handle)
+    }
+
+    /// Find or create the recognizer for a session, sweeping idle ones first.
+    ///
+    /// The sweep can drop a session that a request is still decoding on. That is
+    /// safe — the `Arc` keeps the recognizer alive for the in-flight call — and
+    /// only means the next chunk starts fresh. Preferable to holding the map
+    /// lock across a decode, which would serialise every stream against every
+    /// other one.
+    fn session(
+        &self,
+        id: &str,
+        handle: &NemotronHandle,
+        language: &str,
+    ) -> Result<Arc<Mutex<Nemotron>>, Status> {
+        let mut map = lock(&self.sessions);
+        let now = Instant::now();
+        let before = map.len();
+        map.retain(|_, s| now.duration_since(s.last_used) < SESSION_IDLE);
+        if map.len() != before {
+            tracing::info!("swept {} idle streaming session(s)", before - map.len());
+        }
+
+        if let Some(existing) = map.get_mut(id) {
+            existing.last_used = now;
+            return Ok(Arc::clone(&existing.recognizer));
+        }
+        if map.len() >= MAX_SESSIONS {
+            return Err(Status::resource_exhausted(format!(
+                "{MAX_SESSIONS} streaming sessions already active — there is one GPU. Retry, or \
+                 send `last: true` on sessions you have finished with."
+            )));
+        }
+
+        let mut recognizer = Nemotron::from_shared(handle);
+        // Naming the language is strictly more accurate than letting the model
+        // guess, but only the multilingual export can be told — on the
+        // English-only build the call is a no-op, so it is gated rather than
+        // attempted and swallowed.
+        if is_multilingual(handle) && !language.is_empty() && language != "auto" {
+            recognizer.set_target_lang(language).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "language {language:?} is not one this model knows: {e}"
+                ))
+            })?;
+        }
+
+        let recognizer = Arc::new(Mutex::new(recognizer));
+        map.insert(
+            id.to_string(),
+            Session {
+                recognizer: Arc::clone(&recognizer),
+                last_used: now,
+            },
+        );
+        tracing::info!(
+            session = id,
+            sessions = map.len(),
+            "streaming session opened"
+        );
+        Ok(recognizer)
+    }
+
+    /// Whole-utterance decode against the batch model, one at a time.
+    async fn decode_offline(&self, samples: Vec<f32>) -> Result<String, Status> {
+        // Acquire BEFORE spawning: the point is to reject the caller, not to
+        // park a blocking thread waiting for the GPU.
+        //
+        // ponytail: try_acquire and reject, never a queue. A queue on a single
+        // GPU converts overload into unbounded latency, which is harder to
+        // diagnose than a clean RESOURCE_EXHAUSTED.
+        let _permit = self.permits.clone().try_acquire_owned().map_err(|_| {
+            Status::resource_exhausted(
+                "the GPU is busy with another batch decode — one at a time, by design. Retry.",
+            )
+        })?;
+
+        let model = Arc::clone(&self.model);
+        let result = tokio::task::spawn_blocking(move || {
+            lock(&model).transcribe_samples(samples, SAMPLE_RATE, 1, None)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
+        .map_err(|e| Status::internal(format!("transcription failed: {e}")))?;
+        Ok(result.text)
+    }
+
+    /// One chunk of a continuing stream. Returns only the NEW text — this model
+    /// does not revise past output, which is why the response carries no
+    /// `is_final` and clients simply concatenate.
+    async fn decode_chunk(
+        &self,
+        session_id: &str,
+        language: &str,
+        last: bool,
+        samples: Vec<f32>,
+    ) -> Result<String, Status> {
+        let handle = self.handle().await?;
+        let recognizer = self.session(session_id, &handle, language)?;
+
+        let text =
+            tokio::task::spawn_blocking(move || lock(&recognizer).transcribe_chunk(&samples))
+                .await
+                .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
+                .map_err(|e| Status::internal(format!("streaming transcription failed: {e}")))?;
+
+        if last {
+            let mut map = lock(&self.sessions);
+            map.remove(session_id);
+            tracing::info!(
+                session = session_id,
+                sessions = map.len(),
+                "streaming session closed"
+            );
+        }
+        Ok(text)
     }
 }
 
@@ -74,42 +253,26 @@ impl pb::stt_server::Stt for SttService {
             pcm_s16le_to_f32(&req.audio).map_err(|e| Status::invalid_argument(e.to_string()))?;
         let audio_seconds = samples.len() as f32 / SAMPLE_RATE as f32;
 
-        // Acquire BEFORE spawning: the point is to reject the caller, not to
-        // park a blocking thread waiting for the GPU.
-        let _permit = self.permits.clone().try_acquire_owned().map_err(|_| {
-            Status::resource_exhausted(
-                "the GPU is busy with another decode — one at a time, by design. Retry.",
-            )
-        })?;
-
-        let model = Arc::clone(&self.model);
         let started = Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
-            // A decode that panicked poisons this mutex. Recovering is
-            // deliberate: the alternative is that one bad request bricks the
-            // service until someone notices a pod that is Ready and answers
-            // every call with the same panic.
-            let mut model = model.lock().unwrap_or_else(|poisoned| {
-                tracing::warn!("model mutex was poisoned by a previous panic; recovering");
-                poisoned.into_inner()
-            });
-            model.transcribe_samples(samples, SAMPLE_RATE, 1, None)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
-        .map_err(|e| Status::internal(format!("transcription failed: {e}")))?;
-
+        let text = if req.session_id.is_empty() {
+            self.decode_offline(samples).await?
+        } else {
+            self.decode_chunk(&req.session_id, &cfg.language, req.last, samples)
+                .await?
+        };
         let decode_seconds = started.elapsed().as_secs_f32();
+
         tracing::info!(
             audio_seconds,
             decode_seconds,
             rtf = decode_seconds / audio_seconds,
-            chars = result.text.len(),
+            chars = text.len(),
+            streaming = !req.session_id.is_empty(),
             "recognize"
         );
 
         Ok(Response::new(pb::RecognizeResponse {
-            text: result.text,
+            text,
             audio_seconds,
             decode_seconds,
         }))

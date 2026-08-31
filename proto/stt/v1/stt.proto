@@ -10,10 +10,11 @@ package stt.v1;
 // as of 2026. So realtime is chunked unary at utterance granularity: one
 // transport, one auth path, no partials.
 //
-// StreamingRecognize is NOT declared here. Adding an RPC later is a
-// backward-compatible proto change; getting a message's field numbers wrong is
-// not. An RPC that exists and returns UNIMPLEMENTED is scaffolding pretending
-// to be an interface.
+// There is STILL only one RPC, and that is the point: realtime is the same
+// unary call carrying a session_id. Browsers cannot stream *up* under any
+// transport gRPC offers, so the audio goes as discrete requests regardless —
+// which means a streaming RPC would buy nothing and cost a second code path.
+// ADR-0046 Decision 3.
 service Stt {
   rpc Recognize(RecognizeRequest) returns (RecognizeResponse);
 }
@@ -41,12 +42,31 @@ message RecognizeRequest {
   // Capped at 16 MB by max_decoding_message_size (~8 minutes at 16 kHz).
   bytes audio = 2;
 
-  // Reserved for Phase E's chunk stitching: session_id, offset_ms, last.
-  // Held now so those fields get these numbers when they are actually
-  // honoured. A field the server accepts and ignores is worse than an absent
-  // one — the client cannot tell the difference.
-  reserved 3, 4, 5;
-  reserved "session_id", "offset_ms", "last";
+  // Empty means a one-shot offline decode against the batch model: the whole
+  // request is the whole utterance, and nothing is remembered.
+  //
+  // Non-empty selects REALTIME. The server keeps a streaming recognizer keyed
+  // by this id, so each ~560ms chunk continues the previous one instead of
+  // being decoded in isolation. Chunks must arrive in order — they are audio,
+  // and the encoder carries cache forward.
+  //
+  // Note this id is client-chosen and the bearer token is shared, so any
+  // caller who guesses another's id can interleave audio into it. Accepted at
+  // this trust boundary and recorded in ADR-0046; it stops being acceptable
+  // the moment tokens become per-client.
+  string session_id = 3;
+
+  // offset_ms was reserved for a stateless stitching design that server-side
+  // session state made unnecessary — the server knows where it is in the
+  // stream. Kept reserved rather than reused, so an old client's field 4 can
+  // never be silently reinterpreted.
+  reserved 4;
+  reserved "offset_ms";
+
+  // Ends the session and releases its recognizer. Sessions are also swept on
+  // idle, because browsers close tabs without saying goodbye and that is the
+  // normal case rather than the edge.
+  bool last = 5;
 }
 
 message RecognizeResponse {
@@ -56,6 +76,15 @@ message RecognizeResponse {
   // The failure this service is most prone to is decoding correctly on the
   // wrong device, which looks like success in every way except speed — so the
   // number that reveals it is part of the contract, not a debug log.
+  //
+  // In streaming mode they describe THIS CHUNK, not the session. A client that
+  // wants a session-wide figure accumulates them, which it has to do anyway to
+  // display a running transcript.
   float audio_seconds = 2;
   float decode_seconds = 3;
+
+  // There is deliberately no `is_final`. The streaming model returns the new
+  // text for each chunk rather than a revised running hypothesis, so the client
+  // concatenates and never has to replace a tail. An engine that revises would
+  // need this field and a very different client — see ADR-0046 Consequences.
 }

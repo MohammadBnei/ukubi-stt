@@ -57,8 +57,8 @@ fn gpu_used_mib() -> Result<u64> {
 
 /// 16 kHz mono f32, which is what the TDT model expects.
 fn read_wav_16k_mono(path: &PathBuf) -> Result<(Vec<f32>, f32)> {
-    let mut reader = hound::WavReader::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let mut reader =
+        hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
     let spec = reader.spec();
     if spec.sample_rate != 16_000 || spec.channels != 1 {
         bail!(
@@ -120,7 +120,10 @@ fn main() -> Result<()> {
     let t_load = Instant::now();
     let mut model = ParakeetTDT::from_pretrained(&model_dir, Some(cfg))
         .with_context(|| format!("loading the TDT model from {}", model_dir.display()))?;
-    println!("model loaded in      : {:.1}s", t_load.elapsed().as_secs_f32());
+    println!(
+        "model loaded in      : {:.1}s",
+        t_load.elapsed().as_secs_f32()
+    );
 
     let (samples, audio_seconds, real_speech) = match &audio_arg {
         Some(p) => {
@@ -129,7 +132,9 @@ fn main() -> Result<()> {
             (s, secs, true)
         }
         None => {
-            println!("audio                : synthetic sweep (no file given — transcript check skipped)");
+            println!(
+                "audio                : synthetic sweep (no file given — transcript check skipped)"
+            );
             (synthetic_audio(3.0, 16_000), 3.0, false)
         }
     };

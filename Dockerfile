@@ -10,7 +10,18 @@
 # best guess. If the gate fails at ONNX session creation rather than at the
 # memory assertion, these two lines are the first thing to change.
 ARG CUDA_VERSION=12.6.3
-ARG UBUNTU_VERSION=ubuntu22.04
+# ubuntu24.04, not 22.04. The ONNX Runtime binary that ort downloads is built
+# against a NEWER toolchain than 22.04 ships: linking on 22.04 fails with
+# `undefined symbol: __isoc23_strtoll` (glibc 2.38+) and
+# `_M_replace_cold` (libstdc++ 13+), while 22.04 has glibc 2.35 / libstdc++ 12.
+# 24.04 is glibc 2.39 / libstdc++ 14 and links clean.
+#
+# Note the usual glibc rule — build on an image no newer than the runtime — is
+# necessary but not sufficient here. It constrains OUR binary against the
+# runtime; it says nothing about a third-party prebuilt demanding newer than
+# both. Builder and runtime are pinned to the same version below, so that
+# rule holds regardless.
+ARG UBUNTU_VERSION=ubuntu24.04
 
 # Builder is the -devel variant of the SAME base as the runtime, not rust:1-*.
 # Two reasons, both learned the hard way elsewhere:

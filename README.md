@@ -56,12 +56,39 @@ let cfg = ExecutionConfig::new()
 ParakeetTDT::from_pretrained(dir, Some(cfg))?
 ```
 
-## Running the gate
+## Releasing
+
+Same `release-it` flow as the other build repos (`editable-blog`,
+`agent-fleet`, `wedding-2026`) — conventional-changelog, angular preset,
+`CHANGELOG.md` written in the release commit:
 
 ```bash
-git tag 0.2.0 && git push --tags        # builds on the build-runner LXC (tag == Cargo.toml version)
-kubectl apply -f k8s/gate-pod.yaml
-kubectl logs -f stt-gate
+bun install     # or npm i
+bun run release
+```
+
+**`package.json` holds the canonical version and an `after:bump` hook rewrites
+`Cargo.toml` to match.** Two files, one source of truth, because `image.yml`
+reads the version out of `Cargo.toml` and compares it to the pushed tag — if
+they drift the build fails with "does not match the tag", which is the right
+failure but an annoying one to debug.
+
+`tagName` is the bare `${version}`, not release-it's default `v${version}`, for
+the same reason: `image.yml` compares it to `github.ref_name` verbatim.
+
+The tag push is what builds and pushes the image. There is no deploy step in
+the workflow — ArgoCD picks up `helm/values.yaml` from `main`, so bumping the
+running version is a separate `image.tag` edit there.
+
+## Running the gate
+
+The startup assertion runs on every boot, but `--selftest` is the manual
+version — ADR-0044 Decision 3 keeps it as a flag, not a build gate, because
+there is no point in the build where a GPU is reachable:
+
+```bash
+kubectl exec deploy/ukubi-stt -- ukubi-stt --selftest            # synthetic
+kubectl exec deploy/ukubi-stt -- ukubi-stt --selftest /tmp/a.wav # real audio
 ```
 
 Pass looks like:

@@ -433,7 +433,9 @@ impl Interceptor for BearerAuth {
 
         match matched {
             Some(name) => {
-                request.extensions_mut().insert(ClientName(name.to_string()));
+                request
+                    .extensions_mut()
+                    .insert(ClientName(name.to_string()));
                 Ok(request)
             }
             None => Err(Status::unauthenticated("invalid token")),

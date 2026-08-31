@@ -61,13 +61,14 @@ RUN touch src/main.rs && cargo build --release
 
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-${UBUNTU_VERSION}
 
-# ca-certificates for the model download; python3-pip only to get `hf`, the
-# supported way to pull the ONNX weights. pip is removed again below — the
-# model layer is ~2.5GB and this image is already large enough.
+# curl + ca-certificates only. NOT python3/pip and the `hf` CLI, which is what
+# the HuggingFace docs suggest: on 24.04 `pip3 install` into the system
+# interpreter fails with PEP 668's "error: externally-managed-environment", and
+# working around that (--break-system-packages, or a venv) means carrying ~150MB
+# of Python in the runtime image to fetch four static files. The weights are
+# plain HTTP objects; curl fetches them and the failure class disappears.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates python3 python3-pip \
- && pip3 install --no-cache-dir "huggingface_hub[cli]" \
- && apt-get purge -y python3-pip && apt-get autoremove -y \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
 # Parakeet TDT 0.6B v3 — the offline/batch model, 25 languages with auto
@@ -75,10 +76,17 @@ RUN apt-get update \
 #
 # fp32 export on purpose: int8 is a CPU optimisation and typically runs slower
 # on the ORT CUDA execution provider because of quantise/dequantise round-trips.
+#
+# --retry because encoder-model.onnx.data is ~2.3GB and a truncated download
+# would produce an image that loads a corrupt model at runtime rather than
+# failing here. -f so an HTTP error is a build failure, not a 0-byte file.
 ARG TDT_REPO=istupakov/parakeet-tdt-0.6b-v3-onnx
-RUN hf download "${TDT_REPO}" \
-      encoder-model.onnx encoder-model.onnx.data decoder_joint-model.onnx vocab.txt \
-      --local-dir /models/tdt \
+ARG HF_BASE=https://huggingface.co/${TDT_REPO}/resolve/main
+RUN mkdir -p /models/tdt && cd /models/tdt \
+ && for f in encoder-model.onnx encoder-model.onnx.data decoder_joint-model.onnx vocab.txt; do \
+      echo "fetching $f" && \
+      curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$f" "${HF_BASE}/$f" || exit 1; \
+    done \
  && ls -la /models/tdt
 
 COPY --from=build /src/target/release/ukubi-stt /usr/local/bin/ukubi-stt

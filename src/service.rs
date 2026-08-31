@@ -292,7 +292,13 @@ impl pb::stt_server::Stt for SttService {
                 cfg.sample_rate_hertz
             )));
         }
-        if req.audio.is_empty() {
+        // Empty audio is an error EXCEPT as a bare close. `last` means "flush
+        // and release", and a client that stops recording on an exact chunk
+        // boundary — 1 callback in 35, plus every Stop before speaking — has
+        // nothing left to send but still needs the session flushed and closed.
+        // Rejecting it leaked the recognizer until the idle sweep and dropped
+        // the tail, which is the bug the padding below exists to prevent.
+        if req.audio.is_empty() && !req.last {
             return Err(Status::invalid_argument("audio is empty"));
         }
 
@@ -312,7 +318,12 @@ impl pb::stt_server::Stt for SttService {
         tracing::info!(
             audio_seconds,
             decode_seconds,
-            rtf = decode_seconds / audio_seconds,
+            // A bare close carries no audio, and `x / 0.0` logs as `inf`.
+            rtf = if audio_seconds > 0.0 {
+                decode_seconds / audio_seconds
+            } else {
+                0.0
+            },
             chars = text.len(),
             streaming = !req.session_id.is_empty(),
             "recognize"

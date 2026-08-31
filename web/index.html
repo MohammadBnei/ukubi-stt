@@ -368,6 +368,10 @@ function flushChunk() {
   let need = CHUNK_SAMPLES, off = 0;
   while (need > 0) {
     const head = state.buf[0];
+    // Only reachable if `state.buffered` ever drifts from what `state.buf`
+    // actually holds. Throwing here would be inside the audio callback, which
+    // kills capture silently; stopping short just sends a shorter chunk.
+    if (!head) break;
     const take = Math.min(head.length, need);
     merged.set(head.subarray(0, take), off);
     off += take; need -= take;

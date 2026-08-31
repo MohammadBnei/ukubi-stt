@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/MohammadBnei/ukubi-stt/compare/0.5.1...0.5.2) (2026-08-31)
+
+
+### Bug Fixes
+
+* **streaming:** chunks were 768ms, not 560ms — and the tail waited a round ([#9](https://github.com/MohammadBnei/ukubi-stt/issues/9)) ([6f1134c](https://github.com/MohammadBnei/ukubi-stt/commit/6f1134cc9eaa124a6fe81ee76553c0c9e35e362a)), closes [#8](https://github.com/MohammadBnei/ukubi-stt/issues/8)
+
 ## [0.5.1](https://github.com/MohammadBnei/ukubi-stt/compare/0.5.0...0.5.1) (2026-08-31)
 
 

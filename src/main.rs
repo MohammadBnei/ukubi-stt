@@ -26,7 +26,10 @@
 //! service is most likely to suffer and least likely to notice.
 
 use anyhow::{bail, Context, Result};
-use parakeet_rs::{ExecutionConfig, ExecutionProvider, ParakeetTDT};
+// Transcriber is not decoration: transcribe_samples is a TRAIT method, not an
+// inherent one, so without this import the call is E0599. docs.rs lists it
+// under ParakeetTDT's methods with no hint that it comes from a trait.
+use parakeet_rs::{ExecutionConfig, ExecutionProvider, ParakeetTDT, Transcriber};
 use std::{path::PathBuf, process::Command, time::Instant};
 
 /// Whole-GPU used-memory in MiB, via the `nvidia-smi` the container toolkit

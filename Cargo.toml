@@ -1,6 +1,6 @@
 [package]
 name = "ukubi-stt"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "GPU speech-to-text for ukubi-cluster (ADR-0044)"
 license = "MIT"
@@ -9,17 +9,13 @@ license = "MIT"
 # `cuda` ENABLES the CUDA execution provider; it does NOT select it. Selection
 # is ExecutionConfig::new().with_execution_provider(ExecutionProvider::Cuda) at
 # load time — from_pretrained(path, None) silently defaults to CPU. Both halves
-# are required. See src/main.rs.
-#
-# Default features are kept on deliberately (cpu, ort-defaults, api-28): the CPU
-# provider is registered as ORT's fallback behind CUDA either way, so removing it
-# would not make a CUDA failure louder. Decision 3's assertion is what makes it
-# loud.
+# are required. See src/engine.rs.
 parakeet-rs = { version = "0.3.7", features = ["cuda"] }
 
 # Pinned EXACTLY, not with a caret: ort is a release candidate (2.0.0-rc.13 is
 # the newest published version; there is no stable release). A caret range on a
-# pre-1.0 rc is how a build silently moves to a different ONNX Runtime ABI.
+# pre-1.0 rc is how a build silently moves to a different ONNX Runtime ABI —
+# and per ADR-0045 that ABI decides the base image, so it is not ours to float.
 ort = "=2.0.0-rc.13"
 
 anyhow = "1.0"
@@ -28,6 +24,23 @@ hound = "3.5"
 # ORT explains itself at debug level — which provider it registered, which it
 # declined, and why. ort routes those through `tracing`, parakeet-rs installs no
 # subscriber, so on 2026-08-31 they went nowhere and Gate 0's failure had to be
-# diagnosed by reading ort-sys's build script instead. This is what makes the
-# next one a message.
+# diagnosed by reading ort-sys's build script instead.
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
+tonic = "0.14"
+# tonic 0.14 moved prost codec support into its own crate. The generated module
+# references tonic_prost::ProstCodec, so this is not optional.
+tonic-prost = "0.14"
+prost = "0.14"
+axum = "0.8"
+
+# Constant-time comparison for the bearer token. Hand-rolling this is four
+# lines and the compiler is entitled to optimise the timing property back out;
+# a purpose-built crate with no transitive dependencies is the cheaper correct
+# answer on a security path.
+subtle = "2.6"
+
+[build-dependencies]
+tonic-prost-build = "0.14"

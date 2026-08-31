@@ -1,6 +1,6 @@
 [package]
 name = "ukubi-stt"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 description = "GPU speech-to-text for ukubi-cluster (ADR-0044)"
 license = "MIT"
@@ -24,3 +24,10 @@ ort = "=2.0.0-rc.13"
 
 anyhow = "1.0"
 hound = "3.5"
+
+# ORT explains itself at debug level — which provider it registered, which it
+# declined, and why. ort routes those through `tracing`, parakeet-rs installs no
+# subscriber, so on 2026-08-31 they went nowhere and Gate 0's failure had to be
+# diagnosed by reading ort-sys's build script instead. This is what makes the
+# next one a message.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,42 @@
+{
+  "name": "ukubi-stt",
+  "private": true,
+  "version": "0.3.0",
+  "scripts": {
+    "release": "release-it"
+  },
+  "devDependencies": {
+    "@release-it/conventional-changelog": "^10.0.4",
+    "release-it": "^19.2.4"
+  },
+  "release-it": {
+    "$schema": "https://unpkg.com/release-it@19/schema/release-it.json",
+    "hooks": {
+      "after:bump": "sed -i.bak 's/^version = \".*\"/version = \"${version}\"/' Cargo.toml && rm -f Cargo.toml.bak"
+    },
+    "git": {
+      "commitMessage": "chore: release v${version}",
+      "tagName": "${version}",
+      "pushArgs": [
+        "--follow-tags",
+        "--atomic"
+      ],
+      "requireCommits": true,
+      "requireCommitsFail": false
+    },
+    "github": {
+      "release": false
+    },
+    "npm": {
+      "publish": false
+    },
+    "plugins": {
+      "@release-it/conventional-changelog": {
+        "preset": {
+          "name": "angular"
+        },
+        "infile": "CHANGELOG.md"
+      }
+    }
+  }
+}

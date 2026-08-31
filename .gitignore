@@ -1,3 +1,4 @@
 /target
 /models
 *.wav
+/node_modules

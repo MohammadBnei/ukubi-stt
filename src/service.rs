@@ -159,19 +159,34 @@ impl Interceptor for BearerAuth {
     }
 }
 
-/// `/healthz` and `/livez` on a separate port, unauthenticated and never routed
-/// externally — only :9090 gets an IngressRoute.
+/// The browser test client, served from the SAME ORIGIN as the gRPC endpoint.
+///
+/// That is the whole reason it lives in this binary rather than anywhere else:
+/// same-origin means no CORS on the RPC at all — no preflight carrying
+/// `authorization`, no `grpcWeb.allowOrigins` to keep in step with wherever the
+/// page is hosted, and no failure mode where the RPC works from grpcurl and not
+/// from a browser. `include_str!` so it ships in the binary; a page with no
+/// external assets needs no volume, no second image and no static file server.
+async fn index() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("../web/index.html"))
+}
+
+/// `/` (the test page), `/healthz` and `/livez`, on a port whose ONLY externally
+/// routed path is `/` — the IngressRoute matches `Path(`/`)` exactly, so the
+/// health endpoints stay unreachable from outside as ADR-0044 Decision 5
+/// requires. Routing this port at all is new; routing the probes is not.
 ///
 /// It starts only after the model has loaded and CUDA has been asserted, so
 /// "the port answers" and "the service can actually decode" are the same fact.
 /// A readiness probe that goes green before the GPU is proven is worse than no
 /// probe at all.
-pub async fn serve_health(addr: SocketAddr) -> anyhow::Result<()> {
+pub async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
     let app = axum::Router::new()
+        .route("/", axum::routing::get(index))
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .route("/livez", axum::routing::get(|| async { "ok" }));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("health listening on {addr}");
+    tracing::info!("http (test page + health) listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }

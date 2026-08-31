@@ -1,0 +1,459 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ukubi-stt</title>
+<!--
+  Browser test client for ukubi-stt. ADR-0044 Decision 2 (chunked unary,
+  gRPC-Web converted at the edge) and Decision 5 (shared bearer token).
+
+  SERVED FROM THE SAME ORIGIN AS THE gRPC ENDPOINT, ON PURPOSE.
+  That is the single biggest simplification here: same-origin means no CORS at
+  all — no preflight carrying `authorization`, no `allowOrigins` to keep in step
+  with wherever the page happens to be hosted, and no class of failure where the
+  RPC works from curl and not from a browser. The alternative (hosting this
+  anywhere else) costs a `headers` middleware, a `grpcWeb.allowOrigins` entry,
+  and a preflight on every single call.
+
+  NO BUILD STEP AND NO DEPENDENCIES. The protobuf encoding below is hand-written
+  because the two messages involved have five fields between them; pulling in
+  google-protobuf + protoc-gen-grpc-web to encode `{int32, string, bytes}` would
+  be a toolchain, a vendored bundle and a version to keep current, in exchange
+  for about sixty lines.
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #17181c; --muted: #6b7280; --line: #e4e6eb;
+    --card: #f7f8fa; --accent: #2563eb; --ok: #047857; --warn: #b45309; --err: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --fg: #e6e8ec; --muted: #9aa1ad; --line: #262a33;
+      --card: #171a21; --accent: #60a5fa; --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1rem; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 46rem; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin: 0 0 1.75rem; font-size: .9rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.15rem; margin-bottom: 1rem; }
+  label { display: block; font-size: .8rem; color: var(--muted); margin-bottom: .35rem; }
+  input[type=password], input[type=text] {
+    width: 100%; padding: .55rem .7rem; border: 1px solid var(--line); border-radius: 7px;
+    background: var(--bg); color: var(--fg); font: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem;
+  }
+  button {
+    font: inherit; font-weight: 550; padding: .55rem 1.1rem; border-radius: 7px;
+    border: 1px solid transparent; background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button.ghost { background: transparent; border-color: var(--line); color: var(--fg); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  #meter { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: .9rem; }
+  #meterbar { height: 100%; width: 0%; background: var(--accent); transition: width .06s linear; }
+  #transcript {
+    min-height: 6rem; white-space: pre-wrap; word-break: break-word;
+    font-size: 1.05rem; line-height: 1.6;
+  }
+  #transcript:empty::before { content: "Nothing yet."; color: var(--muted); font-size: .9rem; }
+  .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; font-size: .82rem; color: var(--muted); margin-top: .9rem; padding-top: .9rem; border-top: 1px solid var(--line); }
+  .stats b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+  #log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .78rem; color: var(--muted); max-height: 11rem; overflow-y: auto; }
+  #log div { padding: .12rem 0; }
+  .err { color: var(--err); }
+  .ok { color: var(--ok); }
+  .warn { color: var(--warn); }
+  .hint { font-size: .8rem; color: var(--muted); margin-top: .6rem; }
+  .hidden { display: none; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+</style>
+
+<main>
+  <h1>ukubi-stt</h1>
+  <p class="sub">Parakeet TDT 0.6B on an RTX 2070 SUPER, one decode at a time.</p>
+
+  <div class="card" id="authcard">
+    <label for="token">Bearer token</label>
+    <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="STT_AUTH_TOKEN">
+    <div class="row" style="margin-top:.7rem">
+      <button id="save">Save</button>
+      <button class="ghost" id="forget">Forget</button>
+    </div>
+    <p class="hint">Kept in <code>localStorage</code>. Rotating the token server-side makes every
+      call 401 — this page clears the stored copy and asks again rather than failing silently.</p>
+  </div>
+
+  <div class="card hidden" id="mic">
+    <div class="row">
+      <button id="rec">Record</button>
+      <button class="ghost" id="pick">Send a WAV file</button>
+      <button class="ghost" id="clear">Clear</button>
+      <input type="file" id="file" accept="audio/*,.wav" class="hidden">
+    </div>
+    <div id="meter"><div id="meterbar"></div></div>
+    <p class="hint">Audio is sent in <span id="chunklen">4</span>-second chunks as separate unary
+      calls. Browsers cannot do gRPC client-streaming, so a word can land on a chunk boundary —
+      server-side stitching is Phase E, and the proto already reserves the field numbers for it.</p>
+  </div>
+
+  <div class="card hidden" id="out">
+    <label>Transcript</label>
+    <div id="transcript"></div>
+    <div class="stats">
+      <span>audio <b id="s-audio">0.00</b>s</span>
+      <span>decode <b id="s-decode">0.00</b>s</span>
+      <span>realtime factor <b id="s-rtf">—</b></span>
+      <span>chunks <b id="s-n">0</b></span>
+    </div>
+    <p class="hint" id="rtfnote"></p>
+  </div>
+
+  <div class="card">
+    <label>Log</label>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+const SAMPLE_RATE = 16000;
+const CHUNK_SECONDS = 4;
+const METHOD = "/stt.v1.Stt/Recognize";
+
+const $ = (id) => document.getElementById(id);
+const state = { recording: false, ctx: null, stream: null, node: null, buf: [], buffered: 0,
+                audio: 0, decode: 0, chunks: 0, busy: false };
+
+function log(msg, cls) {
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = new Date().toLocaleTimeString() + "  " + msg;
+  $("log").prepend(d);
+}
+
+/* ---------------------------------------------------------------- protobuf --
+   Just enough of the wire format for two messages. Varints are only ever
+   needed for small non-negative numbers here (a sample rate and byte lengths),
+   so the encoder does not deal with zigzag or negatives — if that ever changes,
+   this is the thing that will be quietly wrong rather than loudly broken.     */
+
+function varint(n) {
+  const out = [];
+  while (n > 127) { out.push((n & 0x7f) | 0x80); n >>>= 7; }
+  out.push(n);
+  return out;
+}
+function lenDelimited(fieldNo, bytes) {
+  return [((fieldNo << 3) | 2), ...varint(bytes.length), ...bytes];
+}
+
+// RecognizeRequest { RecognitionConfig config = 1; bytes audio = 2; }
+// RecognitionConfig { int32 sample_rate_hertz = 1; }
+function encodeRequest(pcm) {
+  const config = [(1 << 3) | 0, ...varint(SAMPLE_RATE)];
+  const head = new Uint8Array([...lenDelimited(1, config), ((2 << 3) | 2), ...varint(pcm.length)]);
+  const out = new Uint8Array(head.length + pcm.length);
+  out.set(head, 0);
+  out.set(pcm, head.length);
+  return out;
+}
+
+// RecognizeResponse { string text = 1; float audio_seconds = 2; float decode_seconds = 3; }
+// Unknown fields are skipped rather than assumed absent, so adding a field
+// server-side does not break this page.
+function decodeResponse(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const out = { text: "", audio_seconds: 0, decode_seconds: 0 };
+  let i = 0;
+  const readVarint = () => {
+    let result = 0, shift = 0, b;
+    do { b = bytes[i++]; result |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+    return result >>> 0;
+  };
+  while (i < bytes.length) {
+    const key = readVarint(), field = key >>> 3, wire = key & 7;
+    if (wire === 2) {
+      const len = readVarint(), slice = bytes.subarray(i, i + len); i += len;
+      if (field === 1) out.text = new TextDecoder().decode(slice);
+    } else if (wire === 5) {
+      const f = view.getFloat32(i, true); i += 4;
+      if (field === 2) out.audio_seconds = f;
+      else if (field === 3) out.decode_seconds = f;
+    } else if (wire === 0) { readVarint(); }
+    else if (wire === 1) { i += 8; }
+    else { throw new Error("unsupported protobuf wire type " + wire); }
+  }
+  return out;
+}
+
+/* ---------------------------------------------------------------- gRPC-Web --
+   Frames are [flag:1][length:4 big-endian][payload]. flag 0x00 is a message,
+   0x80 is the trailer block (grpc-status lives there). A failing interceptor
+   answers with HTTP 200 and grpc-status in the *headers* instead, with no body
+   at all — which is why both are checked. */
+
+const GRPC_CODES = { 3: "INVALID_ARGUMENT", 8: "RESOURCE_EXHAUSTED", 12: "UNIMPLEMENTED",
+                     13: "INTERNAL", 14: "UNAVAILABLE", 16: "UNAUTHENTICATED" };
+
+async function recognize(pcm, token) {
+  const body = encodeRequest(pcm);
+  const framed = new Uint8Array(5 + body.length);
+  framed[0] = 0x00;
+  new DataView(framed.buffer).setUint32(1, body.length, false);
+  framed.set(body, 5);
+
+  const res = await fetch(METHOD, {
+    method: "POST",
+    headers: {
+      "content-type": "application/grpc-web+proto",
+      "x-grpc-web": "1",
+      "authorization": "Bearer " + token,
+    },
+    body: framed,
+  });
+
+  if (!res.ok) throw new Error("HTTP " + res.status + " " + res.statusText);
+
+  const headerStatus = res.headers.get("grpc-status");
+  if (headerStatus && headerStatus !== "0") {
+    throw grpcError(headerStatus, res.headers.get("grpc-message") || "");
+  }
+
+  const buf = new Uint8Array(await res.arrayBuffer());
+  let i = 0, message = null;
+  while (i + 5 <= buf.length) {
+    const flag = buf[i];
+    const len = new DataView(buf.buffer, buf.byteOffset + i + 1, 4).getUint32(0, false);
+    const payload = buf.subarray(i + 5, i + 5 + len);
+    i += 5 + len;
+    if (flag === 0x00) message = decodeResponse(payload);
+    else {
+      const trailers = new TextDecoder().decode(payload);
+      const code = /grpc-status:\s*(\d+)/i.exec(trailers);
+      if (code && code[1] !== "0") {
+        const msg = /grpc-message:\s*(.*)/i.exec(trailers);
+        throw grpcError(code[1], msg ? decodeURIComponent(msg[1].trim()) : "");
+      }
+    }
+  }
+  if (!message) throw new Error("no message frame in the response");
+  return message;
+}
+
+function grpcError(code, message) {
+  const e = new Error((GRPC_CODES[code] || "code " + code) + (message ? ": " + message : ""));
+  e.grpcCode = Number(code);
+  return e;
+}
+
+/* ------------------------------------------------------------------- token --
+   ADR-0044 is explicit that rotation without this handler is "an outage nobody
+   diagnoses": autoReload restarts the pod, every browser then 401s, and there
+   is no path back because the dead token is still sitting in localStorage. */
+
+function getToken() { return localStorage.getItem("stt_token") || ""; }
+function setToken(t) {
+  if (t) localStorage.setItem("stt_token", t); else localStorage.removeItem("stt_token");
+  reflectAuth();
+}
+function reflectAuth() {
+  const has = !!getToken();
+  $("mic").classList.toggle("hidden", !has);
+  $("out").classList.toggle("hidden", !has);
+  $("authcard").classList.toggle("hidden", has);
+}
+function onUnauthenticated() {
+  setToken("");
+  $("token").value = "";
+  log("token rejected — cleared it, enter a new one", "err");
+}
+
+/* -------------------------------------------------------------------- audio */
+
+function toPCM16(f32) {
+  const out = new Uint8Array(f32.length * 2);
+  const view = new DataView(out.buffer);
+  for (let i = 0; i < f32.length; i++) {
+    // Clamp before scaling: a sample above 1.0 wraps to a large negative
+    // int16, which is heard as a click and read by the model as noise.
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return out;
+}
+
+async function send(f32) {
+  if (!f32.length) return;
+  // Semaphore(1) server-side: a second concurrent call gets RESOURCE_EXHAUSTED
+  // rather than queued. Serialising here means we never provoke it.
+  if (state.busy) { log("previous chunk still decoding, dropping this one", "warn"); return; }
+  state.busy = true;
+  try {
+    const started = performance.now();
+    const r = await recognize(toPCM16(f32), getToken());
+    const rtt = (performance.now() - started) / 1000;
+
+    if (r.text.trim()) {
+      $("transcript").textContent += (($("transcript").textContent && " ") || "") + r.text.trim();
+    }
+    state.audio += r.audio_seconds;
+    state.decode += r.decode_seconds;
+    state.chunks += 1;
+    $("s-audio").textContent = state.audio.toFixed(2);
+    $("s-decode").textContent = state.decode.toFixed(2);
+    $("s-n").textContent = state.chunks;
+    const rtf = state.decode / state.audio;
+    $("s-rtf").textContent = rtf.toFixed(4);
+
+    // The number that matters. parakeet-rs falls back to CPU silently, and the
+    // server's own startup assertion is the real guard — but a client-visible
+    // RTF is why audio_seconds and decode_seconds are in the response at all.
+    if (rtf > 0.5) {
+      $("rtfnote").innerHTML = '<span class="warn">RTF above 0.5 — that is CPU-shaped. ' +
+        'The server asserts GPU memory at startup, so check its logs.</span>';
+    } else {
+      $("rtfnote").innerHTML = '<span class="ok">' + Math.round(1 / rtf) +
+        'x faster than realtime.</span>';
+    }
+    log("chunk " + state.chunks + ": " + r.audio_seconds.toFixed(2) + "s audio, " +
+        r.decode_seconds.toFixed(3) + "s decode, " + rtt.toFixed(2) + "s round trip", "ok");
+  } catch (e) {
+    if (e.grpcCode === 16) onUnauthenticated();
+    else log(e.message, "err");
+  } finally {
+    state.busy = false;
+  }
+}
+
+function flush() {
+  if (!state.buffered) return;
+  const merged = new Float32Array(state.buffered);
+  let off = 0;
+  for (const b of state.buf) { merged.set(b, off); off += b.length; }
+  state.buf = []; state.buffered = 0;
+  send(merged);
+}
+
+async function startRecording() {
+  // Forcing the context's rate is what makes this work without a resampler:
+  // the graph resamples the microphone into 16 kHz for us, which is the one
+  // rate the model accepts.
+  state.ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  state.stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  const src = state.ctx.createMediaStreamSource(state.stream);
+
+  // ponytail: ScriptProcessorNode, deprecated but universally supported and
+  // about ten lines. An AudioWorklet needs a separate module file and a message
+  // port to move samples across, for identical behaviour on a test page.
+  state.node = state.ctx.createScriptProcessor(4096, 1, 1);
+  const chunkSamples = SAMPLE_RATE * CHUNK_SECONDS;
+
+  state.node.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    state.buf.push(new Float32Array(input));
+    state.buffered += input.length;
+
+    let peak = 0;
+    for (let i = 0; i < input.length; i += 16) peak = Math.max(peak, Math.abs(input[i]));
+    $("meterbar").style.width = Math.min(100, peak * 140) + "%";
+
+    if (state.buffered >= chunkSamples) flush();
+  };
+
+  // A ScriptProcessor only fires while connected to a destination. Routed
+  // through a silent gain node so the microphone is not played back.
+  const mute = state.ctx.createGain();
+  mute.gain.value = 0;
+  src.connect(state.node);
+  state.node.connect(mute);
+  mute.connect(state.ctx.destination);
+
+  state.recording = true;
+  $("rec").textContent = "Stop";
+  log("recording at " + state.ctx.sampleRate + " Hz, " + CHUNK_SECONDS + "s chunks");
+}
+
+function stopRecording() {
+  state.recording = false;
+  $("rec").textContent = "Record";
+  $("meterbar").style.width = "0%";
+  if (state.node) { state.node.disconnect(); state.node.onaudioprocess = null; state.node = null; }
+  if (state.stream) { state.stream.getTracks().forEach((t) => t.stop()); state.stream = null; }
+  flush();
+  if (state.ctx) { state.ctx.close(); state.ctx = null; }
+  log("stopped");
+}
+
+async function sendFile(file) {
+  log("decoding " + file.name);
+  const raw = await file.arrayBuffer();
+  // decodeAudioData handles wav/mp3/m4a/ogg; the OfflineAudioContext then
+  // resamples and downmixes to the 16 kHz mono the model wants, so the page
+  // accepts whatever the user happens to have rather than only 16k WAVs.
+  const tmp = new (window.AudioContext || window.webkitAudioContext)();
+  const decoded = await tmp.decodeAudioData(raw);
+  await tmp.close();
+
+  const frames = Math.ceil(decoded.duration * SAMPLE_RATE);
+  const off = new OfflineAudioContext(1, frames, SAMPLE_RATE);
+  const src = off.createBufferSource();
+  src.buffer = decoded;
+  src.connect(off.destination);
+  src.start();
+  const rendered = await off.startRendering();
+  const samples = rendered.getChannelData(0);
+
+  log(file.name + ": " + decoded.duration.toFixed(2) + "s, sending in " + CHUNK_SECONDS + "s chunks");
+  const chunk = SAMPLE_RATE * CHUNK_SECONDS;
+  for (let i = 0; i < samples.length; i += chunk) {
+    await send(samples.slice(i, Math.min(i + chunk, samples.length)));
+  }
+}
+
+/* ------------------------------------------------------------------ wiring */
+
+$("save").onclick = () => {
+  const t = $("token").value.trim();
+  if (!t) return log("no token entered", "err");
+  setToken(t);
+  log("token saved");
+};
+$("forget").onclick = () => { setToken(""); $("token").value = ""; log("token cleared"); };
+$("token").onkeydown = (e) => { if (e.key === "Enter") $("save").click(); };
+
+$("rec").onclick = async () => {
+  try {
+    if (state.recording) stopRecording();
+    else await startRecording();
+  } catch (e) {
+    log("microphone: " + e.message, "err");
+  }
+};
+$("pick").onclick = () => $("file").click();
+$("file").onchange = (e) => {
+  const f = e.target.files[0];
+  if (f) sendFile(f).catch((err) => log(err.message, "err"));
+  e.target.value = "";
+};
+$("clear").onclick = () => {
+  $("transcript").textContent = "";
+  state.audio = state.decode = state.chunks = 0;
+  $("s-audio").textContent = $("s-decode").textContent = "0.00";
+  $("s-rtf").textContent = "—";
+  $("s-n").textContent = "0";
+  $("rtfnote").textContent = "";
+};
+
+$("chunklen").textContent = CHUNK_SECONDS;
+$("token").value = getToken();
+reflectAuth();
+log("ready" + (getToken() ? "" : " — enter the bearer token to start"));
+if (!window.isSecureContext) log("not a secure context; getUserMedia will be blocked", "err");
+</script>

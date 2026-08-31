@@ -132,7 +132,7 @@ const CHUNK_SECONDS = CHUNK_SAMPLES / SAMPLE_RATE;
 const METHOD = "/stt.v1.Stt/Recognize";
 
 const $ = (id) => document.getElementById(id);
-const state = { recording: false, ctx: null, stream: null, node: null, buf: [], buffered: 0,
+const state = { recording: false, busy: false, ctx: null, stream: null, node: null, onTail: null,
                 audio: 0, decode: 0, chunks: 0, session: null, queued: 0,
                 // Chunks MUST reach the server in order: the streaming encoder
                 // carries cache forward, so a reordered or dropped chunk
@@ -355,85 +355,112 @@ async function doSend(f32, sessionId, last) {
   }
 }
 
-// Take EXACTLY one encoder chunk and keep the remainder.
-//
-// This used to ship the whole buffer, which was a real latency bug: the audio
-// callback delivers a fixed block at a time, so the buffer crossed 8960 at
-// 12288 samples and sent 768ms instead of 560ms. Worse, 12288 is not a multiple
-// of the encoder's chunk, so the server decoded one chunk and held the
-// remainder until the NEXT request arrived — some audio waited a whole extra
-// round for nothing. Aligning to the encoder's granularity removes both.
-function flushChunk() {
-  const merged = new Float32Array(CHUNK_SAMPLES);
-  let need = CHUNK_SAMPLES, off = 0;
-  while (need > 0) {
-    const head = state.buf[0];
-    // Only reachable if `state.buffered` ever drifts from what `state.buf`
-    // actually holds. Throwing here would be inside the audio callback, which
-    // kills capture silently; stopping short just sends a shorter chunk.
-    if (!head) break;
-    const take = Math.min(head.length, need);
-    merged.set(head.subarray(0, take), off);
-    off += take; need -= take;
-    if (take === head.length) state.buf.shift();
-    else state.buf[0] = head.subarray(take);
-  }
-  state.buffered -= CHUNK_SAMPLES;
-  send(merged, state.session, false);
-}
+/* ------------------------------------------------------- capture (worklet) --
+   Chunking happens INSIDE the audio worklet, not on the main thread.
 
-/// Send whatever is left and close the session. The server pads a final partial
-/// chunk with silence so the encoder flushes its tail.
-function flushTail() {
-  const merged = new Float32Array(state.buffered);
-  let off = 0;
-  for (const b of state.buf) { merged.set(b, off); off += b.length; }
-  state.buf = []; state.buffered = 0;
-  send(merged, state.session, true);
+   The old ScriptProcessorNode delivered 2048 frames at a time, so a chunk could
+   sit up to 128ms waiting for the callback that crossed the boundary — pure
+   added latency on every single chunk. A worklet's render quantum is 128 frames
+   (8ms at 16kHz), which cuts that to noise, and it runs on the audio thread so a
+   busy page cannot stall capture.
+
+   The worklet emits exactly CHUNK_SAMPLES per message, so the main thread has no
+   buffer arithmetic left to get wrong — which is where the last two latency bugs
+   lived.                                                                       */
+
+const WORKLET_SRC = `
+class Chunker extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.size = options.processorOptions.chunkSamples;
+    this.buf = new Float32Array(this.size);
+    this.n = 0;
+    this.quanta = 0;
+    this.peak = 0;
+    // 'flush' asks for the partial tail when recording stops. Without it that
+    // audio dies with the worklet, and the server never gets its close.
+    this.port.onmessage = (e) => {
+      if (e.data === 'flush') {
+        this.port.postMessage({ type: 'tail', samples: this.buf.slice(0, this.n) });
+        this.n = 0;
+      }
+    };
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      const v = ch[i];
+      if (v > this.peak) this.peak = v; else if (-v > this.peak) this.peak = -v;
+    }
+    // A level reading every 8 quanta (~64ms). Posting one per quantum would be
+    // 125 messages a second to move one float.
+    if (++this.quanta >= 8) {
+      this.port.postMessage({ type: 'peak', value: this.peak });
+      this.quanta = 0; this.peak = 0;
+    }
+    let i = 0;
+    while (i < ch.length) {
+      const take = Math.min(ch.length - i, this.size - this.n);
+      this.buf.set(ch.subarray(i, i + take), this.n);
+      this.n += take; i += take;
+      if (this.n === this.size) {
+        this.port.postMessage({ type: 'chunk', samples: this.buf.slice(0) });
+        this.n = 0;
+      }
+    }
+    return true;
+  }
 }
+registerProcessor('chunker', Chunker);
+`;
 
 async function startRecording() {
   // Forcing the context's rate is what makes this work without a resampler:
   // the graph resamples the microphone into 16 kHz for us, which is the one
   // rate the model accepts.
   state.ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+
+  // The worklet module is built from a Blob so this page stays a single file
+  // with no external assets — the same reason nothing here is bundled.
+  const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
+  try {
+    await state.ctx.audioWorklet.addModule(url);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+
   state.stream = await navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   });
-  const src = state.ctx.createMediaStreamSource(state.stream);
 
-  // ponytail: ScriptProcessorNode, deprecated but universally supported and
-  // about ten lines. An AudioWorklet needs a separate module file and a message
-  // port to move samples across, for identical behaviour on a test page.
-  // 2048 frames = 128ms per callback. 4096 doubled the jitter on the chunk
-  // boundary for no benefit — a chunk could sit up to 256ms waiting for the
-  // callback that crossed the threshold.
-  state.node = state.ctx.createScriptProcessor(2048, 1, 1);
   // One id per recording; the server keys a streaming recognizer on it and
   // sweeps it after two idle minutes if we never say `last`.
   state.session = (crypto.randomUUID && crypto.randomUUID()) ||
                   String(Date.now()) + Math.random().toString(36).slice(2);
 
-  state.node.onaudioprocess = (e) => {
-    const input = e.inputBuffer.getChannelData(0);
-    state.buf.push(new Float32Array(input));
-    state.buffered += input.length;
+  state.node = new AudioWorkletNode(state.ctx, "chunker", {
+    numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1,
+    processorOptions: { chunkSamples: CHUNK_SAMPLES },
+  });
 
-    let peak = 0;
-    for (let i = 0; i < input.length; i += 16) peak = Math.max(peak, Math.abs(input[i]));
-    $("meterbar").style.width = Math.min(100, peak * 140) + "%";
-
-    // A loop, not an `if`: never hold more than one chunk's worth back.
-    while (state.buffered >= CHUNK_SAMPLES) flushChunk();
+  state.node.port.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === "peak") {
+      $("meterbar").style.width = Math.min(100, m.value * 140) + "%";
+    } else if (m.type === "chunk") {
+      send(m.samples, state.session, false);
+    } else if (m.type === "tail") {
+      // Sent even when empty: `last` is the close signal, and the server pads
+      // it with silence to flush the encoder's own buffered tail.
+      send(m.samples, state.session, true);
+      if (state.onTail) { state.onTail(); state.onTail = null; }
+    }
   };
 
-  // A ScriptProcessor only fires while connected to a destination. Routed
-  // through a silent gain node so the microphone is not played back.
-  const mute = state.ctx.createGain();
-  mute.gain.value = 0;
-  src.connect(state.node);
-  state.node.connect(mute);
-  mute.connect(state.ctx.destination);
+  // numberOfOutputs: 0 — a worklet runs from the input alone, so unlike a
+  // ScriptProcessor there is no silent gain node needed to keep it alive.
+  state.ctx.createMediaStreamSource(state.stream).connect(state.node);
 
   state.recording = true;
   $("rec").textContent = "Stop";
@@ -441,15 +468,25 @@ async function startRecording() {
       Math.round(CHUNK_SECONDS * 1000) + "ms chunks, session " + state.session.slice(0, 8));
 }
 
-function stopRecording() {
+async function stopRecording() {
   state.recording = false;
   $("rec").textContent = "Record";
   $("meterbar").style.width = "0%";
-  if (state.node) { state.node.disconnect(); state.node.onaudioprocess = null; state.node = null; }
+
+  if (state.node) {
+    // Ask for the tail and wait for it before tearing the graph down, or the
+    // last partial chunk dies with the worklet. Bounded, so a worklet that
+    // never answers cannot wedge the button.
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => { state.onTail = null; resolve(); }, 1000);
+      state.onTail = () => { clearTimeout(timer); resolve(); };
+      state.node.port.postMessage("flush");
+    });
+    state.node.port.onmessage = null;
+    state.node.disconnect();
+    state.node = null;
+  }
   if (state.stream) { state.stream.getTracks().forEach((t) => t.stop()); state.stream = null; }
-  // `last: true` releases the server-side recognizer immediately instead of
-  // leaving it for the idle sweep.
-  flushTail();
   state.session = null;
   if (state.ctx) { state.ctx.close(); state.ctx = null; }
   log("stopped");
@@ -499,11 +536,21 @@ $("forget").onclick = () => { setToken(""); $("token").value = ""; log("token cl
 $("token").onkeydown = (e) => { if (e.key === "Enter") $("save").click(); };
 
 $("rec").onclick = async () => {
+  // stopRecording now awaits the worklet's tail, so the button has a window
+  // where a second click would start a new context on top of one still tearing
+  // down — two AudioContexts, two sessions, and the GPU seeing interleaved
+  // audio. Disabling for the duration is the whole fix.
+  if (state.busy) return;
+  state.busy = true;
+  $("rec").disabled = true;
   try {
-    if (state.recording) stopRecording();
+    if (state.recording) await stopRecording();
     else await startRecording();
   } catch (e) {
     log("microphone: " + e.message, "err");
+  } finally {
+    state.busy = false;
+    $("rec").disabled = false;
   }
 };
 $("pick").onclick = () => $("file").click();

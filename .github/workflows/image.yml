@@ -5,8 +5,13 @@
 #   - --tls-verify=false on login AND push (plain HTTP; LE can't issue for .lan)
 #   - no Node on that box, so read the version with shell, not node -p
 #
-# No deploy job yet: Gate 0 has no helm/values.yaml to bump. It is added with
-# the service, once the gate passes.
+# The deploy job bumps helm/values.yaml's image.tag AFTER the push, never
+# before. Editing that tag in a feature PR looks equivalent and is not: ArgoCD
+# syncs main within seconds of the merge, while the image only exists minutes
+# later when the tag build finishes. Hit for real on 0.4.0 — the pod went
+# Init:ImagePullBackOff against a tag that was still being pushed, and because
+# `strategy: Recreate` had already terminated the old pod, the service was down
+# for the gap rather than merely un-upgraded.
 name: image
 
 on:
@@ -67,3 +72,55 @@ jobs:
           # The LXC shares one thin-provisioned rootfs with the other build
           # repos and this image is ~5GB. Leaving it behind fills the pool.
           sudo buildah rmi "$REGISTRY/$IMAGE:$TAG" "$REGISTRY/$IMAGE:latest" || true
+
+  # Only now does ArgoCD get told about the new tag. Shape copied from
+  # agent-fleet's docker.yml, including its two hard-won details.
+  deploy:
+    needs: build-push
+    # always() + an explicit result check, not a bare `if: github.event_name ==
+    # 'push'`. agent-fleet recorded this from a live v1.1.0 run: the build
+    # genuinely succeeded and deploy was still skipped with zero steps, because
+    # a job's implicit default condition is success()-on-needs and the job graph
+    # was tripping it. always() bypasses the implicit check, so the explicit
+    # comparison below is what actually guards against deploying a failed build.
+    if: >-
+      always() && github.event_name == 'push' &&
+      needs.build-push.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Bump the pinned image tag
+        run: |
+          set -euo pipefail
+          sed -i -E "s/^(  tag: \")[^\"]+(\")/\1${GITHUB_REF_NAME}\2/" helm/values.yaml
+
+          # A no-op sed is the real failure mode here: if the pattern stops
+          # matching, values.yaml keeps naming the previous release, ArgoCD
+          # redeploys nothing, and the workflow is green. Silence would read as
+          # success, so assert the tag actually landed.
+          grep -q "^  tag: \"${GITHUB_REF_NAME}\"$" helm/values.yaml || {
+            echo "::error::image.tag was not bumped in helm/values.yaml — check the sed against the file's actual indentation"
+            exit 1
+          }
+
+      # Pushing with the default GITHUB_TOKEN credential deliberately does NOT
+      # trigger other workflow runs, so this commit cannot re-enter a
+      # push-to-main trigger and start a release loop.
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "ukubi-stt-ci"
+          git config user.email "noreply@bnei.dev"
+          git add helm/values.yaml
+          if git diff --cached --quiet; then
+            echo "image tag already at ${GITHUB_REF_NAME}, nothing to commit"
+            exit 0
+          fi
+          git commit -m "chore(deploy): bump image tag to ${GITHUB_REF_NAME}"
+          git push origin HEAD:main

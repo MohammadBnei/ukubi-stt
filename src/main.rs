@@ -112,8 +112,8 @@ fn serve(model_dir: &std::path::Path) -> Result<()> {
         .build()?
         .block_on(async move {
             tokio::spawn(async move {
-                if let Err(e) = service::serve_health(health).await {
-                    tracing::error!("health listener died: {e}");
+                if let Err(e) = service::serve_http(health).await {
+                    tracing::error!("http listener died: {e}");
                 }
             });
 

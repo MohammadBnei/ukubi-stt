@@ -82,9 +82,13 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
  && rm -f build.rs
 COPY build.rs ./
 COPY proto ./proto
+COPY web ./web
 COPY src ./src
 # cargo fingerprints on content+mtime; the stub above already produced a binary,
 # so touch to force the real sources to compile over it.
+# include_str!("../web/index.html") makes the page a compile-time input, so a
+# page-only edit still rebuilds the binary. That is the intended trade: the
+# alternative is a second artefact to deploy and keep in step with the proto.
 RUN touch src/main.rs build.rs && cargo build --release
 
 # The ORT CUDA provider is NOT part of libonnxruntime.a. It is a separate 79MB

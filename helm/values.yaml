@@ -6,7 +6,7 @@
 
 image:
   repository: registry.bnei.lan:5000/ukubi-stt
-  tag: "0.3.0"
+  tag: "0.4.0"
   pullPolicy: IfNotPresent
 
 replicaCount: 1
@@ -139,12 +139,12 @@ readinessProbe:
 
 # Hand-written because `ingress.enabled: false` renders none of the chart's own.
 #
-# NOT YET HERE, deliberately: the `grpcWeb` middleware and its CORS `headers`
-# companion. They exist only to serve a browser, there is no browser client
-# yet, and `grpcWeb` exposes exactly one property (`allowOrigins`) — CORS lives
-# on a separate `headers` middleware and every browser call is preflighted
-# because it carries `authorization`. Both land with the client, when the origin
-# is a known value rather than a guess.
+# The browser client is served BY THIS SERVICE, from the same origin as the gRPC
+# endpoint, which is why there is no CORS `headers` middleware here and no
+# preflight anywhere. A page hosted elsewhere would need `grpcWeb.allowOrigins`
+# kept in step with its origin plus an `accessControlAllowHeaders` entry for
+# `authorization` — every browser call carries it, so every call would be
+# preflighted. Same-origin deletes that whole surface.
 extraManifests:
   - |
     # Abuse protection on a hostname with no WAF in front of it. Grey-cloud
@@ -183,11 +183,46 @@ extraManifests:
         referrerPolicy: "strict-origin-when-cross-origin"
         stsSeconds: 31536000
   - |
-    # `scheme: h2c` is the whole reason this is hand-written: a gRPC backend
-    # speaks HTTP/2 cleartext, and the chart's IngressRoute template cannot emit
-    # it. The field is an unconstrained string with no enum, so a typo passes
-    # admission and fails at Traefik — verify after deploy, do not trust the
-    # apply.
+    # Converts a gRPC-Web request into a real gRPC one, so the browser never
+    # needs to speak HTTP/2 trailers. ADR-0044 Decision 2 chose this over the
+    # `tonic-web` crate: the edge already terminates TLS and routes, and doing
+    # the same translation in two places is one more thing to keep in sync.
+    #
+    # allowOrigins is our own origin even though the page is same-origin and
+    # therefore never preflighted. It costs nothing, states the intent, and is
+    # the one line that would need changing if the page were ever hosted
+    # elsewhere.
+    #
+    # This middleware is on the gRPC route ONLY. It passes non-gRPC-Web content
+    # types through untouched, so native grpcurl clients on the same path are
+    # unaffected — verified after deploy rather than assumed.
+    apiVersion: traefik.io/v1alpha1
+    kind: Middleware
+    metadata:
+      name: {{ .Release.Name }}-grpcweb
+      namespace: {{ .Release.Namespace }}
+    spec:
+      grpcWeb:
+        allowOrigins:
+          - https://stt.bnei.dev
+  - |
+    # TWO routes on one Host, split by path and given EXPLICIT priorities.
+    #
+    # Traefik's default priority is the rule's length, which would happen to
+    # order these correctly — and would silently stop doing so the day someone
+    # renames a path. Stating it removes the coincidence.
+    #
+    # The page route matches `Path(`/`)` EXACTLY, not a prefix. That is what
+    # keeps ADR-0044 Decision 5's ":8080 health is never routed externally"
+    # true while still serving the page off that port: /healthz and /livez are
+    # on the same listener and are simply not matched by any route. A
+    # PathPrefix(`/`) here would have published them.
+    #
+    # `scheme: h2c` on the gRPC service is the reason this is hand-written at
+    # all — a gRPC backend speaks HTTP/2 cleartext and the chart's IngressRoute
+    # template cannot emit it. The field is an unconstrained string with no
+    # enum, so a typo passes admission and fails at Traefik. Verify after
+    # deploy; do not trust the apply.
     apiVersion: traefik.io/v1alpha1
     kind: IngressRoute
     metadata:
@@ -198,7 +233,22 @@ extraManifests:
         - websecure
       routes:
         - kind: Rule
-          match: Host(`stt.bnei.dev`)
+          match: Host(`stt.bnei.dev`) && PathPrefix(`/stt.v1.Stt/`)
+          priority: 100
+          middlewares:
+            - name: {{ .Release.Name }}-ratelimit
+              namespace: {{ .Release.Namespace }}
+            - name: {{ .Release.Name }}-headers
+              namespace: {{ .Release.Namespace }}
+            - name: {{ .Release.Name }}-grpcweb
+              namespace: {{ .Release.Namespace }}
+          services:
+            - name: {{ .Release.Name }}
+              port: 9090
+              scheme: h2c
+        - kind: Rule
+          match: Host(`stt.bnei.dev`) && Path(`/`)
+          priority: 10
           middlewares:
             - name: {{ .Release.Name }}-ratelimit
               namespace: {{ .Release.Namespace }}
@@ -206,7 +256,6 @@ extraManifests:
               namespace: {{ .Release.Namespace }}
           services:
             - name: {{ .Release.Name }}
-              port: 9090
-              scheme: h2c
+              port: 8080
       tls:
         certResolver: le

@@ -1,0 +1,64 @@
+# Shift the compile check left. image.yml only fires on a tag and takes ~15
+# minutes on the build-runner LXC pulling a multi-GB CUDA tree; a syntax error
+# should not cost that. This runs on every PR and push, on a GitHub-hosted
+# runner, with no GPU involved.
+#
+# It cannot prove CUDA engages — that is Gate 0's job on real hardware, and no
+# hosted runner has an RTX 2070. It proves the code compiles, is formatted, is
+# clippy-clean and its pure helpers behave.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Caches ~/.cargo and target/. The parakeet-rs -> ort -> ndarray/tokenizers
+      # tree is the slow part and it changes only when Cargo.toml does.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      # --features cuda because src/main.rs references ExecutionProvider::Cuda,
+      # which only exists under that cfg — checking without it would compile a
+      # different program than the one that ships.
+      #
+      # Whether ort 2.0.0-rc.13 can resolve its CUDA build on a runner with no
+      # CUDA toolkit is genuinely unknown. If this step fails at ort's build
+      # script rather than on our code, that is useful information for Gate 0
+      # and the fix is to split it: `cargo check` on default features for our
+      # own code, and leave the CUDA path to the real build.
+      - name: Clippy
+        run: cargo clippy --features cuda --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --features cuda
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Advisory-only, and deliberately not blocking: this depends on an ort
+      # release candidate by design (ADR-0044), so a clean audit is not
+      # achievable on demand and a red X here would train people to ignore it.
+      - name: Audit
+        run: cargo audit || true
+        continue-on-error: true

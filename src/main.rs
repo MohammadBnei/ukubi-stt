@@ -182,3 +182,47 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ponytail: the two pure helpers only. gpu_used_mib and main need a GPU and
+    // a model, which is exactly what Gate 0 is for — mocking them here would
+    // test the mock.
+
+    #[test]
+    fn synthetic_audio_has_the_right_length_and_range() {
+        let s = synthetic_audio(3.0, 16_000);
+        assert_eq!(s.len(), 48_000, "3s at 16kHz");
+        assert!(
+            s.iter().all(|v| v.is_finite() && v.abs() <= 1.0),
+            "samples must stay in range or the model sees clipping, not speech"
+        );
+        // Not silence: a zero signal would still exercise the graph, but it
+        // would make an empty transcript ambiguous.
+        assert!(s.iter().any(|v| v.abs() > 0.1));
+    }
+
+    #[test]
+    fn wav_reader_rejects_the_wrong_sample_rate() {
+        // The model is 16kHz mono. Accepting 44.1k silently would produce a
+        // plausible-looking but wrong transcript, and a wrong RTF with it.
+        let dir = std::env::temp_dir().join("ukubi_stt_test_44k.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&dir, spec).unwrap();
+        for _ in 0..100 {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let err = read_wav_16k_mono(&dir).unwrap_err().to_string();
+        assert!(err.contains("16kHz mono"), "got: {err}");
+        let _ = std::fs::remove_file(&dir);
+    }
+}

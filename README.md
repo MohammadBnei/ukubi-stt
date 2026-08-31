@@ -109,6 +109,27 @@ on the ORT CUDA provider because of quantise/dequantise round-trips.
 Batch and streaming are two different models, both GPU-resident. Budget both
 against 8GB before Phase E.
 
+## CI
+
+Two workflows, deliberately split by what they can prove:
+
+| | runs on | proves |
+|---|---|---|
+| `ci.yml` | every PR/push, GitHub-hosted | fmt, clippy, tests, that it compiles |
+| `image.yml` | tags only, build-runner LXC | that it builds into a CUDA image and pushes |
+
+`ci.yml` exists because `image.yml` costs ~15 minutes on the LXC pulling a
+multi-GB CUDA tree, and a syntax error should not cost that. It cannot prove
+CUDA engages — no hosted runner has an RTX 2070, which is the whole reason
+Gate 0 runs on real hardware.
+
+`cargo audit` is advisory and non-blocking on purpose: this depends on an `ort`
+release candidate by design, so a clean audit is not achievable on demand and a
+permanently-red check trains people to ignore it.
+
+**Rollback** is redeploying an earlier tag — the registry keeps the last 3 plus
+`latest` (ADR-0034), so anything older than that is gone and must be rebuilt.
+
 ## Local build
 
 Not possible on a Mac, and not expected to be — the image needs CUDA. Builds run

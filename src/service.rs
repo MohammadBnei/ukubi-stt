@@ -19,6 +19,15 @@ pub mod pb {
     tonic::include_proto!("stt.v1");
 }
 
+/// The compiled proto, served over gRPC reflection. See build.rs.
+pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("stt_descriptor");
+
+/// Which credential a request arrived on. Attached by the interceptor and read
+/// back for logging, so "who is calling this" is answerable without guessing
+/// from traffic shape.
+#[derive(Clone, Debug)]
+pub struct ClientName(pub String);
+
 /// ~8 minutes of 16 kHz mono s16. tonic's default is 4 MB, which is ~2 minutes
 /// — short enough that a normal batch upload fails with a confusing error.
 /// This is also a defence, not just a limit: ADR-0044's grey-cloud hostname has
@@ -277,6 +286,11 @@ impl pb::stt_server::Stt for SttService {
         &self,
         request: Request<pb::RecognizeRequest>,
     ) -> Result<Response<pb::RecognizeResponse>, Status> {
+        let client = request
+            .extensions()
+            .get::<ClientName>()
+            .map(|c| c.0.clone())
+            .unwrap_or_else(|| "unknown".to_string());
         let req = request.into_inner();
         let cfg = req.config.unwrap_or_default();
 
@@ -326,6 +340,7 @@ impl pb::stt_server::Stt for SttService {
             },
             chars = text.len(),
             streaming = !req.session_id.is_empty(),
+            client,
             "recognize"
         );
 
@@ -337,28 +352,62 @@ impl pb::stt_server::Stt for SttService {
     }
 }
 
-/// `authorization: Bearer <token>`, constant-time compared.
+/// `authorization: Bearer <token>`, constant-time compared against every
+/// configured client credential.
 ///
-/// ADR-0044 Decision 5. authentik forwardAuth is rejected here on a technical
-/// ground rather than a preference: its proxy provider answers an
-/// unauthenticated request with a 302 to a login page, which a native gRPC
-/// client cannot follow — it sees a non-`application/grpc` response and fails
-/// opaquely.
+/// ADR-0044 Decision 5 specified ONE shared token, which was right when the
+/// only callers were a browser and the owner's machines. Other services on the
+/// cluster calling this changes that: one shared secret means revoking any
+/// caller revokes all of them, and it is why ADR-0046 had to accept that a
+/// caller can interleave audio into another's `session_id` — they all hold the
+/// same credential, so the id is the only thing separating them.
+///
+/// Credentials are read from the environment as `STT_TOKEN_<NAME>`, one per
+/// caller, plus the original `STT_AUTH_TOKEN` as `default` so nothing that
+/// works today stops working. Adding a caller is a new Infisical secret;
+/// revoking one is deleting it. Both are one action affecting one caller.
+///
+/// forwardAuth remains rejected on the ground ADR-0044 gave: authentik's proxy
+/// provider answers an unauthenticated request with a 302 to a login page,
+/// which a native gRPC client cannot follow.
 #[derive(Clone)]
 pub struct BearerAuth {
-    expected: Arc<Vec<u8>>,
+    clients: Arc<Vec<(String, Vec<u8>)>>,
 }
 
 impl BearerAuth {
-    pub fn new(token: String) -> Self {
-        Self {
-            expected: Arc::new(token.into_bytes()),
-        }
+    /// Collect every configured credential. Errors if there are none rather
+    /// than starting an unauthenticated GPU on a hostname that Certificate
+    /// Transparency publishes minutes after issuance.
+    pub fn from_env() -> anyhow::Result<Self> {
+        let mut clients: Vec<(String, Vec<u8>)> = std::env::vars()
+            .filter(|(_, v)| !v.is_empty())
+            .filter_map(|(k, v)| match k.strip_prefix("STT_TOKEN_") {
+                Some(name) => Some((name.to_lowercase(), v.into_bytes())),
+                None if k == "STT_AUTH_TOKEN" => Some(("default".to_string(), v.into_bytes())),
+                None => None,
+            })
+            .collect();
+        clients.sort_by(|a, b| a.0.cmp(&b.0));
+
+        anyhow::ensure!(
+            !clients.is_empty(),
+            "no credentials configured. Set STT_AUTH_TOKEN, or one STT_TOKEN_<NAME> per caller, \
+             via Infisical (project ukubi-stt-bhr-m). Refusing to serve a GPU with no \
+             authentication on a publicly-resolvable hostname."
+        );
+        tracing::info!(
+            clients = ?clients.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            "bearer credentials loaded"
+        );
+        Ok(Self {
+            clients: Arc::new(clients),
+        })
     }
 }
 
 impl Interceptor for BearerAuth {
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
         let value = request
             .metadata()
             .get("authorization")
@@ -368,14 +417,26 @@ impl Interceptor for BearerAuth {
 
         let presented = value
             .strip_prefix("Bearer ")
-            .ok_or_else(|| Status::unauthenticated("authorization must be `Bearer <token>`"))?;
+            .ok_or_else(|| Status::unauthenticated("authorization must be `Bearer <token>`"))?
+            .as_bytes();
 
-        // subtle's slice impl returns Choice(0) for a length mismatch, so this
-        // covers both halves. The token's *length* is not secret; its content is.
-        if bool::from(presented.as_bytes().ct_eq(&self.expected)) {
-            Ok(request)
-        } else {
-            Err(Status::unauthenticated("invalid token"))
+        // Every credential is compared, with no early exit on the first match:
+        // stopping early would make the response time depend on WHICH client is
+        // calling. subtle's slice impl returns Choice(0) on a length mismatch,
+        // so that case is covered too.
+        let mut matched: Option<&str> = None;
+        for (name, token) in self.clients.iter() {
+            if bool::from(presented.ct_eq(token)) {
+                matched = Some(name);
+            }
+        }
+
+        match matched {
+            Some(name) => {
+                request.extensions_mut().insert(ClientName(name.to_string()));
+                Ok(request)
+            }
+            None => Err(Status::unauthenticated("invalid token")),
         }
     }
 }

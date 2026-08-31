@@ -125,17 +125,9 @@ fn selftest(model_dir: &std::path::Path, audio: Option<PathBuf>) -> Result<()> {
 /// any runtime or listener exists. There is no window in which this process is
 /// reachable but cannot decode.
 fn serve(model_dir: &std::path::Path, stream_dir: PathBuf) -> Result<()> {
-    // Read before the expensive part. A missing token is a config error and
+    // Read before the expensive part. A credential problem is a config error and
     // should not cost a 2.4GB model load and a CUDA context to discover.
-    let token = std::env::var("STT_AUTH_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .context(
-            "STT_AUTH_TOKEN is unset or empty. It comes from Infisical via common-app-chart's \
-             `infisical` block. Refusing to start rather than serving a GPU on a public \
-             hostname with no authentication — Certificate Transparency publishes that \
-             hostname within minutes of issuance (ADR-0044 Consequences).",
-        )?;
+    let auth = service::BearerAuth::from_env()?;
 
     let model = engine::load_and_assert_cuda(model_dir)?;
 
@@ -161,14 +153,31 @@ fn serve(model_dir: &std::path::Path, stream_dir: PathBuf) -> Result<()> {
 
             let inner =
                 SttServer::from_arc(svc).max_decoding_message_size(service::MAX_DECODE_BYTES);
-            let authed = tonic::service::interceptor::InterceptedService::new(
-                inner,
-                service::BearerAuth::new(token),
-            );
+            let authed = tonic::service::interceptor::InterceptedService::new(inner, auth);
+
+            // Reflection, so an in-cluster caller can discover the API without
+            // being handed a .proto first. Registered UNAUTHENTICATED and that
+            // is deliberate rather than an oversight: the IngressRoute matches
+            // PathPrefix(`/stt.v1.Stt/`) while reflection answers on
+            // `/grpc.reflection.v1.*`, so Traefik 404s it and only the pod
+            // network can reach it. The schema is public on GitHub anyway; what
+            // it must not do is become a second externally-reachable surface.
+            //
+            // v1 and v1alpha both: grpcurl and older tooling disagree on which
+            // they ask for, and serving one of them is the kind of thing that
+            // looks fine until someone else's client fails.
+            let reflection_v1 = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(service::FILE_DESCRIPTOR_SET)
+                .build_v1()?;
+            let reflection_v1alpha = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(service::FILE_DESCRIPTOR_SET)
+                .build_v1alpha()?;
 
             tracing::info!("gRPC listening on {grpc}");
             tonic::transport::Server::builder()
                 .add_service(authed)
+                .add_service(reflection_v1)
+                .add_service(reflection_v1alpha)
                 // Recreate is mandatory for this Deployment (the new pod would
                 // request the only nvidia.com/gpu while the old one holds it),
                 // so a clean SIGTERM shutdown is what keeps the gap short.

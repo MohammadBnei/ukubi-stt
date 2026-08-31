@@ -1,5 +1,12 @@
 # Changelog
 
+# [0.6.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.5.3...0.6.0) (2026-08-31)
+
+
+### Features
+
+* gRPC reflection and per-client bearer tokens ([#11](https://github.com/MohammadBnei/ukubi-stt/issues/11)) ([0ddb148](https://github.com/MohammadBnei/ukubi-stt/commit/0ddb148b2a82e3bbe0ea38599f7d3135877ebf82))
+
 ## [0.5.3](https://github.com/MohammadBnei/ukubi-stt/compare/0.5.2...0.5.3) (2026-08-31)
 
 

@@ -88,6 +88,41 @@ export function toPCM16(f32) {
  * @param {(err: Error) => void} [opts.onError]
  * @param {(level: number) => void} [opts.onLevel]  0..1, ~every 64ms
  */
+// Everything that can be built BEFORE the user clicks: the AudioContext and the
+// compiled worklet. Neither touches the microphone, so this asks for no
+// permission and turns on no recording indicator — it is safe to call on hover
+// or on mount, and that is the point.
+//
+// Without it the click path is: fetch this module, construct a context, compile
+// a worklet, THEN open the device. The first words of the sentence land in that
+// gap and are simply never captured. Reported from agent-fleet's composer as
+// "the start of my phrase is not transcribed", 2026-09-01.
+//
+// Memoised, so hover-then-click warms once and repeated hovers are free.
+let warmPromise = null;
+
+export function prewarm() {
+  if (!warmPromise) {
+    warmPromise = (async () => {
+      // Forcing the context rate is what removes the need for a resampler: the
+      // graph resamples the microphone into 16 kHz, the one rate the model takes.
+      const c = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+      // Built from a Blob so this module stays a single file with no sibling
+      // asset to deploy alongside it.
+      const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
+      try {
+        await c.audioWorklet.addModule(url);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+      return c;
+    })();
+    // A failed warm must not be cached, or the button is dead until reload.
+    warmPromise.catch(() => { warmPromise = null; });
+  }
+  return warmPromise;
+}
+
 export function createDictation({ send, onError = () => {}, onLevel = () => {} }) {
   let ctx = null, stream = null, node = null;
   let chain = Promise.resolve();
@@ -119,22 +154,30 @@ export function createDictation({ send, onError = () => {}, onLevel = () => {} }
 
   async function start() {
     abandoned = false;
-    // Forcing the context rate is what removes the need for a resampler: the
-    // graph resamples the microphone into 16 kHz, the one rate the model takes.
-    ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
 
-    // Built from a Blob so this module stays a single file with no sibling asset
-    // to deploy alongside it.
-    const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
-    try {
-      await ctx.audioWorklet.addModule(url);
-    } finally {
-      URL.revokeObjectURL(url);
-    }
-
-    stream = await navigator.mediaDevices.getUserMedia({
+    // Kicked off BEFORE the context work rather than after it. These two are
+    // independent, and getUserMedia is the slow one — opening the device with
+    // echo cancellation and AGC is 100-300ms. Serialising them behind
+    // addModule() put the whole context setup in front of the microphone for
+    // no reason, and every millisecond here is speech the user has already
+    // said into a graph that does not exist yet.
+    const micPromise = navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    // Do not let an unhandled rejection escape if the context work throws first.
+    micPromise.catch(() => {});
+
+    ctx = await prewarm();
+    // This dictation owns the context now; the next prewarm() builds a new one.
+    warmPromise = null;
+
+    stream = await micPromise;
+
+    // A context built outside a user gesture starts suspended, and a suspended
+    // context runs no worklet — it would look live and capture silence. resume()
+    // is called from the click that reached start(), which is what makes it
+    // allowed.
+    if (ctx.state === "suspended") await ctx.resume();
 
     node = new AudioWorkletNode(ctx, "chunker", {
       numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1,

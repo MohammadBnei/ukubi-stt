@@ -122,7 +122,7 @@
 
 <script type="module">
 "use strict";
-import { createDictation, toPCM16 } from "/stt-capture.js";
+import { createDictation, prewarm, toPCM16 } from "/stt-capture.js";
 
 const SAMPLE_RATE = 16000;
 // The streaming encoder runs at 560ms granularity (8960 samples at 16kHz), so
@@ -418,6 +418,11 @@ $("save").onclick = () => {
 };
 $("forget").onclick = () => { setToken(""); $("token").value = ""; log("token cleared"); };
 $("token").onkeydown = (e) => { if (e.key === "Enter") $("save").click(); };
+
+// Build the context and compile the worklet on hover, so the click only has to
+// open the microphone. Neither touches the device, so this prompts for nothing.
+$("rec").addEventListener("pointerenter", () => { void prewarm(); }, { once: true });
+$("rec").addEventListener("focus", () => { void prewarm(); }, { once: true });
 
 $("rec").onclick = async () => {
   // stopRecording now awaits the worklet's tail, so the button has a window

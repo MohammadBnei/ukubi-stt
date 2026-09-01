@@ -148,7 +148,7 @@ fn selftest_fa(
         text.push_str(&out);
     }
     let decode_seconds = started.elapsed().as_secs_f32();
-    let hypothesis = persian::detokenise(&text);
+    let hypothesis = persian::tidy(&text);
 
     println!("decode_seconds : {decode_seconds:.2}");
     println!("real-time factor: {:.3}", decode_seconds / audio_seconds);

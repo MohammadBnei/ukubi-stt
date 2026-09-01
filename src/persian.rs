@@ -155,6 +155,9 @@ pub struct PersianStream {
     /// failure into short, fluent, wrong output.
     unks: usize,
     finished: bool,
+    /// Whether anything has been emitted yet, so the utterance's leading word
+    /// separator can be trimmed exactly once.
+    emitted: bool,
 }
 
 impl PersianStream {
@@ -169,6 +172,7 @@ impl PersianStream {
             prev_token: BLANK,
             unks: 0,
             finished: false,
+            emitted: false,
         }
     }
 
@@ -212,6 +216,19 @@ impl PersianStream {
                 // The tail is entirely overlap already consumed by the last window.
                 self.frames.clear();
             }
+        }
+        // SentencePiece `▁` is a word separator, so it becomes a space HERE rather
+        // than in the caller. Doing it per chunk and not trimming is deliberate: a
+        // word boundary can fall on a chunk boundary, and trimming each chunk would
+        // silently glue the last word of one to the first word of the next. Only
+        // the utterance's very first separator is dropped.
+        let mut text = text.replace('\u{2581}', " ");
+        if !self.emitted {
+            let trimmed = text.trim_start().to_string();
+            if !trimmed.is_empty() {
+                self.emitted = true;
+            }
+            text = trimmed;
         }
         Ok(text)
     }
@@ -345,9 +362,11 @@ fn load_tokens(path: &Path) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
-/// SentencePiece detokenisation.
-pub fn detokenise(s: &str) -> String {
-    s.replace('\u{2581}', " ").trim().to_string()
+/// Trailing tidy for whole transcripts. `PersianStream::push` already turns the
+/// SentencePiece separators into spaces as it goes, because a word boundary can
+/// fall on a chunk boundary and trimming per chunk would glue words together.
+pub fn tidy(s: &str) -> String {
+    s.trim().to_string()
 }
 
 /// Character error rate, for `--selftest-fa`.
@@ -392,8 +411,8 @@ mod tests {
     }
 
     #[test]
-    fn detokenise_turns_sentencepiece_marks_into_spaces() {
-        assert_eq!(detokenise("\u{2581}از\u{2581}زندان"), "از زندان");
-        assert_eq!(detokenise(""), "");
+    fn tidy_only_trims() {
+        assert_eq!(tidy("  از زندان  "), "از زندان");
+        assert_eq!(tidy(""), "");
     }
 }

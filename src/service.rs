@@ -132,8 +132,6 @@ impl SttService {
         }
     }
 
-
-
     /// Load the streaming model now, in the background, so the first streaming
     /// request does not pay for it.
     ///

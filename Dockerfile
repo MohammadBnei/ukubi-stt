@@ -73,12 +73,18 @@ ENV PATH=/root/.cargo/bin:$PATH
 
 WORKDIR /src
 # Dependencies first, so a source-only edit does not rebuild the parakeet-rs/ort
-# tree. Cargo.lock is copied when present; on the very first build it does not
-# exist yet, which is why this is not `--locked`.
+# tree.
+#
+# `--locked` since the lockfile is committed: without it cargo will happily
+# resolve a newer dependency at build time, and the one that matters is realfft,
+# which src/fbank.rs's golden vectors are measured against. A silently bumped FFT
+# is a silently different mel. The glob on Cargo.lock stays — it costs nothing and
+# keeps the copy step working if the file is ever absent — but `--locked` will
+# fail loudly in that case rather than resolving freely, which is the point.
 COPY Cargo.toml Cargo.lock* ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs \
  && printf 'fn main() {}\n' > build.rs \
- && cargo build --release \
+ && cargo build --release --locked \
  && rm -f build.rs
 COPY build.rs ./
 COPY proto ./proto
@@ -93,7 +99,7 @@ COPY src ./src
 # include_str!("../web/index.html") makes the page a compile-time input, so a
 # page-only edit still rebuilds the binary. That is the intended trade: the
 # alternative is a second artefact to deploy and keep in step with the proto.
-RUN touch src/main.rs build.rs && cargo build --release
+RUN touch src/main.rs build.rs && cargo build --release --locked
 
 # The ORT CUDA provider is NOT part of libonnxruntime.a. It is a separate 79MB
 # shared object that ORT dlopens on first use, resolved against the directory of

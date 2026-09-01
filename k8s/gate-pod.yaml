@@ -7,6 +7,15 @@
 #   kubectl delete pod stt-gate
 #
 # A non-zero exit is the gate failing, and the message says which half broke.
+#
+# STALE, kept for the record: this runs the image with NO arguments, and
+# main.rs maps no-args to serve(), not to --selftest. It has not done what its
+# header claims since --selftest grew arguments. For the Persian gate see
+# k8s/gate-fa-pod.yaml, which is current and was actually run.
+#
+# Do NOT `kubectl exec` a selftest into the running Deployment (as README once
+# suggested): with two models already resident at 6880 MiB of 8192, loading more
+# on top OOMs the live service.
 apiVersion: v1
 kind: Pod
 metadata:

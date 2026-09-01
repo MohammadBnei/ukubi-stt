@@ -1,0 +1,79 @@
+# Persian gate (ADR-0047). One-shot, not managed by ArgoCD, deleted afterwards.
+#
+#   kubectl create configmap ukubi-stt-gate-audio -n ukubi-stt --from-file=fa.wav=<a 16kHz mono clip>
+#   kubectl apply -f k8s/gate-fa-pod.yaml
+#   kubectl logs -f ukubi-stt-gate-fa -n ukubi-stt
+#   kubectl delete pod ukubi-stt-gate-fa -n ukubi-stt
+#
+# RESULT, 2026-09-01, on k8s-worker-01 with the 0.9.0 image:
+#   CER 0.000, 44.8 ms per model step, RTF 0.045, 0 <unk>.
+# A step is 1.12 s of audio, so that is 4% duty per stream. Persian ships on the
+# CPU provider and takes no GPU memory at all.
+#
+# IT DOES NOT NEED THE GPU, AND THEREFORE DOES NOT NEED AN OUTAGE. The plan
+# assumed both. Two corrections, both worth keeping:
+#
+#  - `local-path` RWO means one *node*, not one *pod*. This pod mounts the same
+#    PVC as the running Deployment because both land on k8s-worker-01, so the
+#    service stays up throughout. Scaling to 0 was never necessary.
+#  - Scaling the Deployment by hand does not work anyway: the ApplicationSet
+#    restores `syncPolicy.automated`, so ArgoCD selfHeal puts the replica back
+#    within seconds. Anything needing a real scale-down has to go through git.
+#
+# To measure the CUDA path instead, add `runtimeClassName: nvidia` and
+# `nvidia.com/gpu: 1` — and that DOES contend for the single card, so it needs
+# the Deployment stopped via git first. There is currently no reason to.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ukubi-stt-gate-fa
+  namespace: ukubi-stt
+spec:
+  restartPolicy: Never
+  # Must match where the PVC is bound; local-path is node-pinned.
+  nodeSelector:
+    kubernetes.io/hostname: k8s-worker-01
+  containers:
+    - name: gate
+      image: registry.bnei.lan:5000/ukubi-stt:0.9.0
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -e
+          D=/models/shenava
+          mkdir -p "$D"
+          for f in model.onnx tokens.txt; do
+            [ -s "$D/$f" ] || {
+              curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$D/$f.part" \
+                "https://huggingface.co/PersianML/Shenava-Koochik-v1.0-tract-streaming/resolve/main/$f"
+              mv "$D/$f.part" "$D/$f"
+            }
+          done
+          ls -la "$D"
+          STT_FA_DEVICE=${STT_FA_DEVICE:-cpu} /usr/local/bin/ukubi-stt --selftest-fa /audio/fa.wav "$REF"
+      env:
+        - name: STT_FA_MODEL_DIR
+          value: /models/shenava
+        - name: STT_FA_DEVICE
+          value: cpu
+        # The reference transcript for the clip in the ConfigMap. CER is only
+        # computed when this is set.
+        - name: REF
+          value: ""
+        # ORT is extremely chatty at debug; info is enough to see which provider
+        # it picked without 240KB of graph optimiser output.
+        - name: RUST_LOG
+          value: "info,ort=info"
+      volumeMounts:
+        - {name: data, mountPath: /models}
+        - {name: audio, mountPath: /audio}
+      resources:
+        requests: {cpu: "1", memory: 2Gi}
+        limits: {cpu: "3", memory: 8Gi}
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: ukubi-stt
+    - name: audio
+      configMap:
+        name: ukubi-stt-gate-audio

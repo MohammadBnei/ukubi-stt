@@ -120,8 +120,9 @@
   </div>
 </main>
 
-<script>
+<script type="module">
 "use strict";
+import { createDictation, toPCM16 } from "/stt-capture.js";
 
 const SAMPLE_RATE = 16000;
 // The streaming encoder runs at 560ms granularity (8960 samples at 16kHz), so
@@ -133,12 +134,7 @@ const METHOD = "/stt.v1.Stt/Recognize";
 
 const $ = (id) => document.getElementById(id);
 const state = { recording: false, busy: false, ctx: null, stream: null, node: null, onTail: null,
-                audio: 0, decode: 0, chunks: 0, session: null, queued: 0,
-                // Chunks MUST reach the server in order: the streaming encoder
-                // carries cache forward, so a reordered or dropped chunk
-                // corrupts everything after it. A promise chain is the whole
-                // mechanism — one in flight at a time, strictly sequential.
-                chain: Promise.resolve() };
+                audio: 0, decode: 0, chunks: 0, session: null };
 
 function log(msg, cls) {
   const d = document.createElement("div");
@@ -305,23 +301,12 @@ function toPCM16(f32) {
   return out;
 }
 
-// Enqueue rather than drop. The previous version dropped a chunk when one was
-// already in flight, which is survivable for independent offline chunks and
-// corrupting for a stream. Decode is ~20-50ms per 560ms of audio, so the queue
-// drains an order of magnitude faster than it fills.
-function send(f32, sessionId, last) {
-  if (!f32.length && !last) return state.chain;
-  state.queued += 1;
-  state.chain = state.chain.then(() => doSend(f32, sessionId, last)).finally(() => {
-    state.queued -= 1;
-  });
-  return state.chain;
-}
-
-async function doSend(f32, sessionId, last) {
+// Ordering and queueing live in /stt-capture.js for the microphone path. The
+// file path below is a single offline request, so it needs neither.
+async function doSend(pcm, sessionId, last) {
   try {
     const started = performance.now();
-    const r = await recognize(toPCM16(f32), getToken(), sessionId, last);
+    const r = await recognize(pcm, getToken(), sessionId, last);
     const rtt = (performance.now() - started) / 1000;
 
     if (r.text.trim()) {
@@ -348,147 +333,46 @@ async function doSend(f32, sessionId, last) {
     }
     log("chunk " + state.chunks + ": " + r.audio_seconds.toFixed(2) + "s audio, " +
         r.decode_seconds.toFixed(3) + "s decode, " + rtt.toFixed(2) + "s round trip" +
-        (state.queued > 1 ? "  (" + (state.queued - 1) + " queued)" : ""), "ok");
+        "ok");
   } catch (e) {
     if (e.grpcCode === 16) onUnauthenticated();
     else log(e.message, "err");
   }
 }
 
-/* ------------------------------------------------------- capture (worklet) --
-   Chunking happens INSIDE the audio worklet, not on the main thread.
+/* ------------------------------------------------------------- capture ----
+   The microphone half lives in /stt-capture.js so this page and every consumer
+   share one implementation — the chunk arithmetic in there carried three
+   separate latency bugs and should not exist twice. This file keeps only the
+   transport: same-origin gRPC-Web straight to :9090.                          */
 
-   The old ScriptProcessorNode delivered 2048 frames at a time, so a chunk could
-   sit up to 128ms waiting for the callback that crossed the boundary — pure
-   added latency on every single chunk. A worklet's render quantum is 128 frames
-   (8ms at 16kHz), which cuts that to noise, and it runs on the audio thread so a
-   busy page cannot stall capture.
-
-   The worklet emits exactly CHUNK_SAMPLES per message, so the main thread has no
-   buffer arithmetic left to get wrong — which is where the last two latency bugs
-   lived.                                                                       */
-
-const WORKLET_SRC = `
-class Chunker extends AudioWorkletProcessor {
-  constructor(options) {
-    super();
-    this.size = options.processorOptions.chunkSamples;
-    this.buf = new Float32Array(this.size);
-    this.n = 0;
-    this.quanta = 0;
-    this.peak = 0;
-    // 'flush' asks for the partial tail when recording stops. Without it that
-    // audio dies with the worklet, and the server never gets its close.
-    this.port.onmessage = (e) => {
-      if (e.data === 'flush') {
-        this.port.postMessage({ type: 'tail', samples: this.buf.slice(0, this.n) });
-        this.n = 0;
-      }
-    };
-  }
-  process(inputs) {
-    const ch = inputs[0] && inputs[0][0];
-    if (!ch) return true;
-    for (let i = 0; i < ch.length; i++) {
-      const v = ch[i];
-      if (v > this.peak) this.peak = v; else if (-v > this.peak) this.peak = -v;
-    }
-    // A level reading every 8 quanta (~64ms). Posting one per quantum would be
-    // 125 messages a second to move one float.
-    if (++this.quanta >= 8) {
-      this.port.postMessage({ type: 'peak', value: this.peak });
-      this.quanta = 0; this.peak = 0;
-    }
-    let i = 0;
-    while (i < ch.length) {
-      const take = Math.min(ch.length - i, this.size - this.n);
-      this.buf.set(ch.subarray(i, i + take), this.n);
-      this.n += take; i += take;
-      if (this.n === this.size) {
-        this.port.postMessage({ type: 'chunk', samples: this.buf.slice(0) });
-        this.n = 0;
-      }
-    }
-    return true;
-  }
-}
-registerProcessor('chunker', Chunker);
-`;
+let dictation = null;
 
 async function startRecording() {
-  // Forcing the context's rate is what makes this work without a resampler:
-  // the graph resamples the microphone into 16 kHz for us, which is the one
-  // rate the model accepts.
-  state.ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-
-  // The worklet module is built from a Blob so this page stays a single file
-  // with no external assets — the same reason nothing here is bundled.
-  const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
-  try {
-    await state.ctx.audioWorklet.addModule(url);
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-
-  state.stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-  });
-
-  // One id per recording; the server keys a streaming recognizer on it and
-  // sweeps it after two idle minutes if we never say `last`.
   state.session = (crypto.randomUUID && crypto.randomUUID()) ||
                   String(Date.now()) + Math.random().toString(36).slice(2);
 
-  state.node = new AudioWorkletNode(state.ctx, "chunker", {
-    numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1,
-    processorOptions: { chunkSamples: CHUNK_SAMPLES },
+  dictation = createDictation({
+    // The module hands us ordered chunks and never overlaps them; all this has
+    // to do is the RPC.
+    send: (pcm, last) => doSend(pcm, state.session, last),
+    onLevel: (v) => { $("meterbar").style.width = Math.min(100, v * 140) + "%"; },
+    onError: (e) => log("dictation stopped: " + e.message, "err"),
   });
 
-  state.node.port.onmessage = (e) => {
-    const m = e.data;
-    if (m.type === "peak") {
-      $("meterbar").style.width = Math.min(100, m.value * 140) + "%";
-    } else if (m.type === "chunk") {
-      send(m.samples, state.session, false);
-    } else if (m.type === "tail") {
-      // Sent even when empty: `last` is the close signal, and the server pads
-      // it with silence to flush the encoder's own buffered tail.
-      send(m.samples, state.session, true);
-      if (state.onTail) { state.onTail(); state.onTail = null; }
-    }
-  };
-
-  // numberOfOutputs: 0 — a worklet runs from the input alone, so unlike a
-  // ScriptProcessor there is no silent gain node needed to keep it alive.
-  state.ctx.createMediaStreamSource(state.stream).connect(state.node);
-
+  await dictation.start();
   state.recording = true;
   $("rec").textContent = "Stop";
-  log("recording at " + state.ctx.sampleRate + " Hz, streaming in " +
-      Math.round(CHUNK_SECONDS * 1000) + "ms chunks, session " + state.session.slice(0, 8));
+  log("recording, streaming in " + Math.round(CHUNK_SECONDS * 1000) +
+      "ms chunks, session " + state.session.slice(0, 8));
 }
 
 async function stopRecording() {
   state.recording = false;
   $("rec").textContent = "Record";
   $("meterbar").style.width = "0%";
-
-  if (state.node) {
-    // Ask for the tail and wait for it before tearing the graph down, or the
-    // last partial chunk dies with the worklet. Bounded, so a worklet that
-    // never answers cannot wedge the button.
-    await new Promise((resolve) => {
-      const timer = setTimeout(() => { state.onTail = null; resolve(); }, 1000);
-      state.onTail = () => { clearTimeout(timer); resolve(); };
-      state.node.port.postMessage("flush");
-    });
-    state.node.port.onmessage = null;
-    state.node.disconnect();
-    state.node = null;
-  }
-  if (state.stream) { state.stream.getTracks().forEach((t) => t.stop()); state.stream = null; }
+  if (dictation) { await dictation.stop(); dictation = null; }
   state.session = null;
-  if (state.ctx) { state.ctx.close(); state.ctx = null; }
   log("stopped");
 }
 
@@ -521,7 +405,7 @@ async function sendFile(file) {
     return;
   }
   log(file.name + ": " + decoded.duration.toFixed(2) + "s, one offline decode");
-  await send(samples, "", false);
+  await doSend(toPCM16(samples), "", false);
 }
 
 /* ------------------------------------------------------------------ wiring */

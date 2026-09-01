@@ -275,7 +275,10 @@ extraManifests:
               port: 9090
               scheme: h2c
         - kind: Rule
-          match: Host(`stt.bnei.dev`) && Path(`/`)
+          # Two EXACT paths, still not a prefix — /healthz and /livez live on
+          # this same listener and must stay unrouted (ADR-0044 Decision 5).
+          # PathPrefix(`/`) here would publish them.
+          match: Host(`stt.bnei.dev`) && (Path(`/`) || Path(`/stt-capture.js`))
           priority: 10
           middlewares:
             - name: {{ .Release.Name }}-ratelimit

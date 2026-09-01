@@ -525,6 +525,22 @@ async fn index() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("../web/index.html"))
 }
 
+/// The capture module, served so the page and every consumer share ONE copy.
+///
+/// It is a separate file rather than inlined because consumers vendor it, and a
+/// second copy inside index.html would be the fiction of a "shared module" that
+/// immediately drifts. The IngressRoute matches this path EXACTLY, the same way
+/// it matches `/` — not a prefix — so adding it does not expose /healthz.
+async fn capture_module() -> impl axum::response::IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        include_str!("../web/stt-capture.js"),
+    )
+}
+
 /// `/` (the test page), `/healthz` and `/livez`, on a port whose ONLY externally
 /// routed path is `/` — the IngressRoute matches `Path(`/`)` exactly, so the
 /// health endpoints stay unreachable from outside as ADR-0044 Decision 5
@@ -537,6 +553,7 @@ async fn index() -> axum::response::Html<&'static str> {
 pub async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route("/", axum::routing::get(index))
+        .route("/stt-capture.js", axum::routing::get(capture_module))
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .route("/livez", axum::routing::get(|| async { "ok" }));
     let listener = tokio::net::TcpListener::bind(addr).await?;

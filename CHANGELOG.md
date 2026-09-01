@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/MohammadBnei/ukubi-stt/compare/0.10.0...0.10.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* **stt:** detokenise Persian in the service, not only in the selftest ([#22](https://github.com/MohammadBnei/ukubi-stt/issues/22)) ([1631be9](https://github.com/MohammadBnei/ukubi-stt/commit/1631be941c5fcabb968529496f9d732e545de809))
+
 # [0.10.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.9.0...0.10.0) (2026-09-01)
 
 

@@ -13,11 +13,8 @@
 //! where a GPU is reachable.
 
 mod engine;
-// Nothing calls this yet — the ORT session that consumes it lands next, and CI runs
-// clippy with -D warnings. Delete this attribute in that change; if it is still here
-// once src/persian.rs exists, something did not get wired up.
-#[allow(dead_code)]
 mod fbank;
+mod persian;
 mod service;
 
 use anyhow::{Context, Result};
@@ -49,12 +46,22 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| "/models/nemotron".into())
         .into();
 
+    let fa_dir: PathBuf = std::env::var("STT_FA_MODEL_DIR")
+        .unwrap_or_else(|_| "/models/shenava".into())
+        .into();
+
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("--selftest") => selftest(&model_dir, args.next().map(PathBuf::from)),
         Some("--selftest-stream") => selftest_stream(&model_dir, &stream_dir),
+        Some("--selftest-fa") => {
+            let wav = args.next().map(PathBuf::from);
+            let reference = args.next();
+            selftest_fa(&fa_dir, wav, reference)
+        }
         Some(other) => anyhow::bail!(
-            "unknown argument {other:?} — expected --selftest [wav] or --selftest-stream"
+            "unknown argument {other:?} — expected --selftest [wav], --selftest-stream, \
+             or --selftest-fa [wav] [reference text]"
         ),
         None => serve(&model_dir, stream_dir),
     }
@@ -84,6 +91,113 @@ fn selftest_stream(model_dir: &std::path::Path, stream_dir: &std::path::Path) ->
         after_both - after_batch
     );
     println!("\nBOTH MODELS RESIDENT. If this printed, the card holds them together.");
+    Ok(())
+}
+
+/// Persian gate: decode a clip and report what it produced, how fast, and — when a
+/// reference transcript is supplied — how wrong.
+///
+/// Runs on CPU unless `STT_FA_DEVICE=cuda`. That default is not a preference, it is
+/// the state of an open question: the model's published "83.9 ms per 1.12 s chunk"
+/// is a *tract* measurement of unknown thread count, so it predicts neither ORT
+/// provider, and the card already holds 6880 MiB of 8192 with two models resident.
+/// This subcommand exists to replace that guess with a number on both devices.
+///
+/// CER rather than WER: Persian word-level error is dominated by ezāfe and ZWNJ
+/// variants, which move for reasons unrelated to whether the pipeline is correct.
+fn selftest_fa(
+    fa_dir: &std::path::Path,
+    audio: Option<PathBuf>,
+    reference: Option<String>,
+) -> Result<()> {
+    let device = match std::env::var("STT_FA_DEVICE").as_deref() {
+        Ok("cuda") => persian::Device::Cuda,
+        Ok("cpu") | Err(_) => persian::Device::Cpu,
+        Ok(other) => anyhow::bail!("STT_FA_DEVICE={other:?} — expected \"cpu\" or \"cuda\""),
+    };
+    println!("model dir      : {}", fa_dir.display());
+    println!("device         : {device:?}");
+
+    let baseline = engine::gpu_used_mib().ok();
+    let mut model = persian::PersianModel::load(fa_dir, device)?;
+    if let (Some(before), Some(after)) = (baseline, engine::gpu_used_mib().ok()) {
+        println!("gpu delta      : {} MiB", after.saturating_sub(before));
+    }
+
+    let Some(path) = audio else {
+        println!("\nLOADED. Pass a 16 kHz mono WAV to decode one.");
+        return Ok(());
+    };
+    let (samples, audio_seconds) = engine::read_wav_16k_mono(&path)?;
+    println!("audio          : {} ({audio_seconds:.2}s)", path.display());
+
+    // Fed in 560 ms chunks, which is exactly what the browser sends. Decoding it in
+    // one call would exercise a path no client uses.
+    let mut stream = persian::PersianStream::new();
+    let started = std::time::Instant::now();
+    let mut text = String::new();
+    let mut steps = 0usize;
+    let mut chunks = samples.chunks(8960).peekable();
+    while let Some(chunk) = chunks.next() {
+        let out = stream.push(&mut model, chunk, chunks.peek().is_none())?;
+        if !out.is_empty() {
+            steps += 1;
+        }
+        text.push_str(&out);
+    }
+    let decode_seconds = started.elapsed().as_secs_f32();
+    let hypothesis = persian::detokenise(&text);
+
+    println!("decode_seconds : {decode_seconds:.2}");
+    println!("real-time factor: {:.3}", decode_seconds / audio_seconds);
+    if steps > 0 {
+        // The number that decides CPU vs CUDA. Per model step, not per request:
+        // steps are a fixed 121 frames wide, so this is comparable across runs
+        // where a per-request RTF is not.
+        println!(
+            "ms per step    : {:.1}",
+            decode_seconds * 1000.0 / steps as f32
+        );
+    }
+    println!("unk tokens     : {}", stream.unks());
+    println!("transcript     : {hypothesis}");
+
+    if hypothesis.is_empty() {
+        anyhow::bail!(
+            "empty transcript. If the audio was real speech this is the signature of a \
+             wrong feature pipeline — per-feature CMVN in particular takes this model \
+             from 0.033 CER to empty output."
+        );
+    }
+    if stream.unks() > 0 {
+        println!(
+            "\nWARNING: {} <unk> tokens. Persian decoded through a model that cannot \
+             write it looks exactly like this.",
+            stream.unks()
+        );
+    }
+    if let Some(want) = reference {
+        let cer = persian::cer(&want, &hypothesis);
+        println!("reference      : {want}");
+        println!("CER            : {cer:.3}");
+        // 0.15 is the gate. Above 0.30 the pipeline is wrong; between the two the
+        // pipeline is right and the export is worse than advertised, which is a
+        // product decision rather than a failure.
+        if cer > 0.30 {
+            anyhow::bail!(
+                "CER {cer:.3} — this is a pipeline fault, not a weak model. Suspects, in \
+                 order: log-mel framing, the blank id, prev_token collapse across step \
+                 boundaries, cache_last_channel_len threading."
+            );
+        }
+        if cer > 0.15 {
+            println!(
+                "\nWARNING: CER {cer:.3} is above the 0.15 gate but below 0.30 — the \
+                      pipeline looks right and the export looks weak."
+            );
+        }
+    }
+    println!("\nSELFTEST PASSED");
     Ok(())
 }
 

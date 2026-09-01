@@ -9,24 +9,21 @@ Design and rationale live in the infra repo, not here:
 [ADR-0043](https://github.com/MohammadBnei/infra-bootstrap/blob/main/docs/adr/0043-gpu-node-enablement.md)
 (the GPU it runs on).
 
-## Status: Gate 0 — unproven
+## Status: live
 
-**There is no service here yet, on purpose.**
+Gate 0 passed on 2026-08-31 and the service has been in production since, with
+two consumers: **dream-analyst** (`/dreams/new`) and **agent-fleet** (the
+console composer). Streaming lands text roughly 560ms behind speech.
 
-The whole design rests on one unverified assumption: that `parakeet-rs`'s CUDA
-execution provider actually engages on a Turing card through this cluster's
-container runtime. Until that is measured, writing the gRPC layer would be
-building on sand — and specifically, an engine swap invalidates the *streaming
-proto*, which is the one artefact that does not survive a change of engine. So
-the proto is deliberately not written yet either.
+The gate itself is kept below, because it is the check to re-run after any
+change to the image, the driver, the node or the `ort`/`parakeet-rs` versions —
+and because the failure it guards against is silent.
 
-`src/main.rs` is the whole repo: load the model, measure GPU memory across load
-and warmup, decode, report a real-time factor, and **exit non-zero if the GPU
-was never touched**.
+### The assumption everything rests on
 
-It compiles, is clippy-clean under `-D warnings`, and its two unit tests pass
-in CI. That says nothing about whether CUDA engages — no hosted runner has an
-RTX 2070 — which is precisely what the gate is for.
+`parakeet-rs`'s CUDA execution provider must actually engage. If it does not,
+the model still loads, still transcribes, and still returns correct text —
+roughly 30x slower, with nothing in the logs that reads as an error.
 
 ### Why that assertion is not paranoia
 
@@ -171,18 +168,229 @@ Not `sherpa-onnx`: its `build.rs` contains zero occurrences of `cuda` or `gpu`
 and only ever downloads the CPU tarball, so `provider: Some("cuda")` links a
 CPU-only runtime and decodes on CPU. Same class of trap, no escape hatch.
 
-## Calling it from something else
+## Integrating a consumer
 
-Three transports, one API, one credential scheme.
+Both existing consumers were built this way, and the shape is not optional if
+your consumer has users.
+
+### Architecture: your backend proxies, the browser holds nothing
+
+```
+browser ──(your app's own session cookie, SAME-ORIGIN)──▶ your backend ──(STT_TOKEN_<YOU>)──▶ ukubi-stt
+```
+
+**No browser ever holds an STT credential.** Handing one to the page would give
+every user of your app a credential for the GPU, recoverable from devtools, and
+`stt.bnei.dev` appears in Certificate Transparency logs minutes after issuance —
+so the endpoint is not obscure.
+
+It also happens to be the only shape that works. Both consumers discovered the
+same wall independently: their APIs allow no CORS and their session cookies are
+`SameSite=Lax`, so a cross-origin call from the page carries no identity at all.
+There is nothing to relax — the proxy is the design.
+
+The pay-off beyond credentials: **the `session_id` stops being client-chosen.**
+Derive it server-side from the authenticated user (an HMAC over identity plus a
+per-dictation id) and one user cannot interleave audio into another's
+recognizer. ADR-0046 accepted that hazard when every caller shared one token;
+this closes it.
+
+### Step 1 — a token
+
+Add `STT_TOKEN_<YOURAPP>` to Infisical `ukubi-stt-bhr-m` (env `dev`). The
+service scans its whole environment for `STT_TOKEN_*` at startup, so adding a
+caller is adding a secret — no redeploy, no code change — and revoking one
+caller does not revoke the others. The matched name is logged with every
+request as `client=`, which is the only reason a leak can be attributed to one
+consumer rather than all of them.
+
+**Then copy the value into your own Infisical project.** This is deliberate and
+it is *not* what a first instinct suggests. Granting your app's identity read on
+`ukubi-stt-bhr-m` looks tidier and avoids a second copy to rotate — but an
+`InfisicalSecret` syncs the **whole project env** into your namespace. Doing
+that for dream-analyst put `REGISTRY_PASSWORD` — push rights on the registry
+every node in the cluster pulls from — into its namespace. `secretsScope`
+narrows what is *synced* but not what the identity may *read*. Two copies to
+rotate is the smaller problem.
+
+### Step 2 — the server side
+
+Address it at **`ukubi-stt.ukubi-stt.svc.cluster.local:9090`**, plaintext h2c.
+Not `stt.bnei.dev`. In-cluster skips TLS, the ingress and the gRPC-Web
+translation, and the whole edge — CORS, rate limiting, idle timeouts — stops
+being your problem. Keep the address in an env var so local development can
+point at the public host.
+
+Make the dependency **optional**. Both consumers log and disable the feature if
+the token is absent or the dial fails, and answer `UNAVAILABLE` thereafter. A
+service that refuses to start without STT trades a working product for a broken
+deployment, on a single-replica pod whose node reboots for gaming.
+
+Map errors before they reach your users: `RESOURCE_EXHAUSTED` (session cap) and
+`FAILED_PRECONDITION` (streaming model not loaded) are both "try later", not
+"you did something wrong".
+
+If you expose this to your own frontend over gRPC, use **chunked unary, not
+server-streaming.** A browser cannot stream *up* under any transport gRPC
+offers, so audio arrives as discrete requests regardless — and each chunk's text
+comes back in that chunk's own response. A server stream would add lifecycle,
+reconnect machinery and a cursor to deliver one message per request already
+made.
+
+### Step 3 — the browser side
+
+**Vendor `web/stt-capture.js`.** Do not import it from `https://stt.bnei.dev` —
+a cross-origin import makes your microphone break whenever this node reboots,
+turning a degraded feature into a broken page. Copy it, keep the header naming
+the origin, and re-copy when it changes. Drift is the accepted cost.
+
+The module is transport-agnostic: it emits 16 kHz mono s16 PCM chunks and calls
+your `send(pcm, last)`. It knows nothing about gRPC, tokens or origins, which is
+why two consumers with different backends use it unmodified.
+
+```js
+import { createDictation, prewarm } from './stt-capture.js';
+
+// On hover/focus — builds the AudioContext and compiles the worklet.
+// Touches no device, so it prompts for nothing.
+button.addEventListener('pointerenter', () => void prewarm());
+
+const dictation = createDictation({
+  send: (pcm, last) => postToYourOwnBackend(pcm, last),
+  onError: (e) => { /* abandon; do NOT retry the chunk */ },
+});
+await dictation.start();
+// ...later
+await dictation.stop();   // flushes the tail and waits for it to land
+```
+
+**Two contracts, both load-bearing:**
+
+*Chunks are strictly ordered and never concurrent.* The encoder carries cache
+forward, so a re-sent or reordered chunk corrupts everything after it. The
+module serialises sends through a promise chain — that is a **contract, not an
+implementation detail**. A consumer that "optimises" it into parallel sends
+corrupts every transcript after the first reorder. On any error, abandon: send
+nothing further, keep the text already appended, surface the failure. The
+orphaned recognizer is swept after 120s idle.
+
+*Never retry a streaming chunk.* Same reason.
+
+## Caveats, all of them learned the hard way
+
+Every one of these cost real time. They are grouped by who hits them.
+
+### If you are changing this service
+
+**CUDA fails open, not closed.** `parakeet-rs` puts `error_on_failure()` on the
+*CPU* provider, so a CUDA failure falls through to CPU silently and returns
+correct text ~30x slower. And the `cuda` cargo feature *enables* the provider,
+it does not *select* it — `from_pretrained(path, None)` gives you a CPU session
+no matter what was compiled in. Both halves are required. Run the gate.
+
+**The provider is a separate 79MB `.so` that must be beside the executable.**
+It is dlopened at runtime, not linked. Copy it with `cp -L` — the build copies
+*symlinks* on Unix, and a dangling symlink in the image is a runtime CPU
+fallback, i.e. the silent failure above.
+
+**CUDA major version must match the base image.** `ort-sys` ships no cuda12
+Linux build, which is why the image is on CUDA 13 rather than 12.6.
+
+**Turn ORT's logging down.** At `info` it drowns the startup lines you actually
+need in BFCArena allocation noise; only ~10 lines survived rotation when the
+first real diagnosis was needed.
+
+### If you are writing a client
+
+**`MediaRecorder` cannot do streaming.** With a `timeslice` it emits WebM
+*cluster fragments* that are **not independently decodable**, so a live path
+cannot reuse a batch recording route. `AudioContext({sampleRate: 16000})` plus
+an AudioWorklet is the only option — and forcing the context rate is what
+removes the need to write a resampler.
+
+**Chunk arithmetic is where the bugs live.** Three separate latency bugs shipped
+during 0.5.x, none visible in review: shipping the whole buffer sent 768ms
+chunks and left the server holding a remainder (~1.4s and irregular instead of
+~650ms); a 2048-frame callback added up to 128ms of jitter; and the tail flush
+sent zero samples when the buffer landed exactly empty — 1 callback in 35, and
+*every* Stop before speaking — which the server then rejected, losing the last
+words and leaking the session. This is why the module exists once and is
+vendored rather than reimplemented.
+
+**An empty final chunk is a valid close.** Do not filter it out.
+
+**The first words go missing if you build the graph on click.** Fetching the
+module, constructing a context, compiling a worklet and *then* opening the
+device is several hundred milliseconds of speech nobody captured. Call
+`prewarm()` on hover, and note `getUserMedia` was originally serialised behind
+`addModule()` for no reason — they are independent and the device is the slow
+one.
+
+**A context built outside a user gesture starts suspended, and a suspended
+context runs no worklet.** A naive prewarm therefore looks live and records pure
+*silence* — worse than the bug it fixes, because nothing errors. `start()`
+resumes it, which is permitted because the click is what reached it. Also: never
+memoise a *failed* warm, or the button is dead until reload.
+
+**Show an arming state.** Even fully warmed, `getUserMedia` is 100-300ms. A
+button that looks ready while the graph is still being built invites exactly the
+words that go missing. Prewarming shrinks the gap; showing it stops the gap
+costing a sentence. Pre-opening the microphone would close it entirely and is
+deliberately not done — it leaves the recording indicator lit on a page the user
+has not asked to record on.
+
+**Append with a functional state update.** In React,
+`onChange(value + text)` captures `value` from the render that started the
+recording, so every chunk appends to the same stale string and visibly
+overwrites the last. `onChange(prev => prev + text)` reads current state and
+captures nothing. A latest-callback ref fixes the stale render but *not* two
+chunks landing in the same tick, which the tail flush does.
+
+**Do not send chunks through a framework's RPC serialisation.** SvelteKit's
+remote functions devalue the argument and then base64 the whole JSON string, so
+the expansion compounds: `v.array(v.number())` is ~4.9x, even
+`v.instance(Uint8Array)` is ~1.78x, a raw `application/octet-stream` body is
+1.0x. At two chunks per second that penalty is continuous.
+
+### If you are operating it
+
+**One batch decode at a time, cluster-wide.** The offline path holds a
+`Semaphore(1)` and a second caller gets `RESOURCE_EXHAUSTED` *immediately* —
+there is no queue, deliberately, because a queue on a single GPU turns overload
+into unbounded latency. Streaming is different: `STT_MAX_SESSIONS` concurrent
+sessions (default 8), since each occupies the GPU for only 20-50ms per 560ms
+chunk.
+
+**Rotating any token restarts the pod.** `autoReload: true` plus
+`strategy: Recreate`. Sessions are in-memory in a single replica, so every
+in-flight dictation loses its encoder cache and resumes mid-sentence with no
+error the user can see. **Adding a consumer's token is a maintenance action, not
+a routine one.**
+
+**This service is best-effort and will disappear.** Single replica, pinned to
+the one node with a GPU, no HA and no CPU fallback — all deliberate (ADR-0044
+Context), including that `.165` reboots for gaming and takes STT with it.
+**Treat `UNAVAILABLE` as normal and degrade.** If a consumer genuinely needs
+uptime, that reopens ADR-0044's availability decision rather than being worked
+around in the client.
+
+**Streaming accuracy is visibly below the offline model** ("UQB cluster" for
+"Yukie cluster"). Fine for dictation into an editable box; not for anything
+acting on the transcript unreviewed.
+
+**Releases are cut by hand.** There is no release workflow here — `image.yml`
+triggers on `push: tags` and nothing creates a tag. Run `bun run release` (see
+Releasing above). Merging to `main` builds nothing.
+
+## Reference
+
+### Transports
 
 | caller | address | notes |
 |---|---|---|
-| another pod on ukubi-cluster | `ukubi-stt.ukubi-stt.svc.cluster.local:9090` | plaintext h2c — no TLS, no Traefik, ~1ms of network |
+| another pod on ukubi-cluster | `ukubi-stt.ukubi-stt.svc.cluster.local:9090` | plaintext h2c — no TLS, no Traefik, ~1ms of network. **Use this.** |
 | a machine on LAN/WAN | `stt.bnei.dev:443` | TLS, native gRPC |
 | a browser | `https://stt.bnei.dev` | gRPC-Web; `web/index.html` is a working reference client |
-
-**In-cluster is the one to use if you have the choice.** It skips TLS, the
-ingress and the gRPC-Web translation, and it is the same API.
 
 ### Discovering the API
 
@@ -195,26 +403,19 @@ grpcurl -plaintext ukubi-stt:9090 describe stt.v1.Stt.Recognize
 
 **In-cluster only, by construction.** The IngressRoute matches
 `PathPrefix(/stt.v1.Stt/)`; reflection answers on `/grpc.reflection.v1.*`, so
-Traefik 404s it from outside. External callers still need the proto — it is in
-`proto/stt/v1/stt.proto` in this repo.
+Traefik 404s it from outside. External callers need the proto from
+`proto/stt/v1/stt.proto`.
 
 ### Credentials
 
-Every call carries `authorization: Bearer <token>`. Each caller gets its own:
-
 ```
-STT_TOKEN_<NAME>   one per caller, e.g. STT_TOKEN_FLEET, STT_TOKEN_BROWSER
+STT_TOKEN_<NAME>   one per caller, e.g. STT_TOKEN_FLEET, STT_TOKEN_DREAMER
 STT_AUTH_TOKEN     the original, still accepted, reported as client "default"
 ```
 
-They live in Infisical (`ukubi-stt-bhr-m`) and reach the pod through
-`common-app-chart`'s `infisical` block, which passes the whole project as env
-vars — so **adding a caller is adding a secret, and revoking one is deleting
-it**. No redeploy, no code change, and revoking one caller does not revoke the
-others. The matched name is logged with every request.
-
-A consumer in a different Infisical project should be granted read on this one
-rather than given a copy of the value; two copies means two things to rotate.
+The comparison loop deliberately has **no early exit** — it checks every
+configured token even after a match, so response time is not a function of a
+token's position in the map.
 
 ### Making a call
 
@@ -232,23 +433,6 @@ factor.
 Leave `session_id` empty for a one-shot decode of a whole utterance. Set it (and
 send ~560ms chunks in order, `last: true` on the final one) for realtime — see
 ADR-0046.
-
-### Two things to design around
-
-**One batch decode at a time, cluster-wide.** The offline path holds a
-`Semaphore(1)` and a second caller gets `RESOURCE_EXHAUSTED` *immediately* —
-there is no queue, deliberately, because a queue on a single GPU turns overload
-into unbounded latency. **Callers need retry with backoff.** Streaming is
-different: eight concurrent sessions, since each occupies the GPU for only
-20-50ms per 560ms chunk.
-
-**This service is best-effort and will disappear.** Single replica, pinned to
-the one node with a GPU, no HA and no CPU fallback — all deliberate (ADR-0044
-Context), including that `.165` reboots for gaming and takes STT with it.
-**Treat `UNAVAILABLE` as normal and degrade**; do not build something whose
-correctness depends on STT answering. If a consumer ever genuinely needs uptime,
-that reopens ADR-0044's availability decision rather than being worked around in
-the client.
 
 ## Models
 

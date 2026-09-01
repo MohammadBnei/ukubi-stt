@@ -1,6 +1,6 @@
 [package]
 name = "ukubi-stt"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "GPU speech-to-text for ukubi-cluster (ADR-0044)"
 license = "MIT"

@@ -1,5 +1,18 @@
 # Changelog
 
+# [0.7.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.6.0...0.7.0) (2026-09-01)
+
+
+### Bug Fixes
+
+* **streaming:** a close must never open a session ([#12](https://github.com/MohammadBnei/ukubi-stt/issues/12)) ([759c318](https://github.com/MohammadBnei/ukubi-stt/commit/759c318552ff5a4276f208035d9591efcd1164f5))
+
+
+### Features
+
+* STT_MAX_SESSIONS, so the streaming cap is tunable ([#13](https://github.com/MohammadBnei/ukubi-stt/issues/13)) ([4e21ebd](https://github.com/MohammadBnei/ukubi-stt/commit/4e21ebd6a9c1dbe65e0b608d710ea9dff17350be))
+* **web:** extract the capture module, served as one shared copy ([#14](https://github.com/MohammadBnei/ukubi-stt/issues/14)) ([6ecb1f0](https://github.com/MohammadBnei/ukubi-stt/commit/6ecb1f03edf6ba17129ed678f368767e4f2ba6d8))
+
 # [0.6.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.5.3...0.6.0) (2026-08-31)
 
 

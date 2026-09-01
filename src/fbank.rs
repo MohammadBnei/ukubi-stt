@@ -35,10 +35,10 @@
 //! as though they were.
 
 use anyhow::{bail, Context, Result};
+use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
 use std::sync::Arc;
 
-pub const SAMPLE_RATE: u32 = 16_000;
 pub const N_MELS: usize = 80;
 pub const N_FFT: usize = 512;
 pub const WIN_LEN: usize = 400;
@@ -60,7 +60,7 @@ const GUARD: f32 = 5.960_464_5e-8;
 /// web assets, and keeps this runnable with no PVC and no network.
 const MEL_FILTERS_JSON: &str = include_str!("../assets/mel_filters_slaney_80x257.json");
 
-/// Streaming log-mel. One per session: it carries the sample tail and the
+/// Streaming log-mel. One per session: it carries the unconsumed samples and the
 /// preemphasis state across chunk boundaries.
 pub struct Fbank {
     /// Row-major `[N_MELS][N_BINS]`, flattened. Flat rather than nested because the
@@ -69,15 +69,22 @@ pub struct Fbank {
     /// Hann(400, periodic=false) already zero-padded to `N_FFT` and centred.
     window: Vec<f32>,
     fft: Arc<dyn RealToComplex<f32>>,
-    /// Samples kept for the next call. `N_FFT - HOP`, **not** `WIN_LEN - HOP`: a
-    /// frame consumes `N_FFT` samples even though only `WIN_LEN` of them are
-    /// weighted, so the overlap is 352 and a 240 here silently drops audio.
-    tail: Vec<f32>,
-    /// The last *raw* (pre-emphasis) sample of the previous chunk. Preemphasis is a
-    /// one-tap IIR, so without this every chunk boundary re-applies the
-    /// utterance-start special case and injects a discontinuity every 560 ms.
-    prev_raw: f32,
+    /// Post-emphasis samples not yet consumed by a frame. Before the first frame is
+    /// emitted this also accumulates the utterance opening, because the centre pad
+    /// mirrors it and cannot be built until enough of it has arrived.
+    ///
+    /// Carries `N_FFT - HOP` between calls in steady state — **not** `WIN_LEN - HOP`:
+    /// a frame consumes `N_FFT` samples even though only `WIN_LEN` of them are
+    /// weighted, so the overlap is 352 and a 240 here would silently drop audio.
+    pending: Vec<f32>,
+    /// Last *raw* sample of the previous chunk; `None` until the utterance starts.
+    /// Preemphasis is a one-tap IIR, so without this every chunk boundary re-applies
+    /// the utterance-start special case and injects a discontinuity every 560 ms.
+    prev_raw: Option<f32>,
+    /// Whether the left reflect-pad has been emitted.
     started: bool,
+    scratch_in: Vec<f32>,
+    scratch_out: Vec<Complex<f32>>,
 }
 
 impl Fbank {
@@ -101,13 +108,17 @@ impl Fbank {
             *w = 0.5 - 0.5 * phase.cos();
         }
 
+        let fft = RealFftPlanner::<f32>::new().plan_fft_forward(N_FFT);
+        let scratch_out = fft.make_output_vec();
         Ok(Self {
             filters: rows.into_iter().flatten().collect(),
             window,
-            fft: RealFftPlanner::<f32>::new().plan_fft_forward(N_FFT),
-            tail: Vec::new(),
-            prev_raw: 0.0,
+            fft,
+            pending: Vec::new(),
+            prev_raw: None,
             started: false,
+            scratch_in: Vec::with_capacity(N_FFT),
+            scratch_out,
         })
     }
 
@@ -116,36 +127,33 @@ impl Fbank {
     /// `last` closes the utterance and applies the right-hand reflect pad. It is
     /// legal — and normal — to call with an empty slice and `last: true`: the
     /// service's bare-close path does exactly that, so this must not panic.
+    ///
+    /// The result does not depend on how the audio is divided across calls. That is
+    /// a contract, not an accident: the offline path feeds engine-sized slices while
+    /// the browser sends 560 ms ones, and both must decode identically.
     pub fn push(&mut self, samples: &[f32], last: bool) -> Vec<[f32; N_MELS]> {
-        let mut buf = Vec::with_capacity(self.tail.len() + samples.len() + 2 * CENTER_PAD);
+        let emphasised = self.preemphasise(samples);
 
-        // Preemphasis before any padding, matching NeMo's ordering. The tail is
-        // stored POST-emphasis, so only the new samples are filtered here.
-        let mut emphasised = Vec::with_capacity(samples.len());
-        for (i, &s) in samples.iter().enumerate() {
-            let prev = if i == 0 {
-                self.prev_raw
-            } else {
-                samples[i - 1]
-            };
-            // The very first sample of the utterance has no predecessor; NeMo leaves
-            // it unfiltered rather than assuming silence before it.
-            emphasised.push(if i == 0 && !self.started {
-                s
-            } else {
-                s - PREEMPH * prev
-            });
-        }
-        if let Some(&lastraw) = samples.last() {
-            self.prev_raw = lastraw;
-        }
+        // Taken out of `self` so `frame` can hold `&mut self` for its scratch
+        // buffers while this stays borrowed.
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(&emphasised);
 
         if !self.started {
-            buf.extend(reflect_pad_front(&emphasised, CENTER_PAD));
+            // The centre reflect-pad mirrors the first CENTER_PAD samples of the
+            // UTTERANCE, so it cannot be built from a chunk shorter than that.
+            // Building it early zero-fills instead of mirroring and corrupts the
+            // first one or two frames — silently, which is the whole thing this
+            // module exists to avoid. Wait instead; it costs 16 ms of latency once.
+            if buf.len() <= CENTER_PAD && !last {
+                self.pending = buf;
+                return Vec::new();
+            }
+            let pad = reflect_pad_front(&buf, CENTER_PAD);
+            buf.splice(0..0, pad);
             self.started = true;
         }
-        buf.extend_from_slice(&self.tail);
-        buf.extend_from_slice(&emphasised);
+
         if last {
             let pad = reflect_pad_back(&buf, CENTER_PAD);
             buf.extend(pad);
@@ -159,7 +167,7 @@ impl Fbank {
         }
 
         // Keep what a future frame will still need. On `last` there is no future.
-        self.tail = if last {
+        self.pending = if last {
             Vec::new()
         } else {
             buf[start..].to_vec()
@@ -167,29 +175,60 @@ impl Fbank {
         out
     }
 
-    fn frame(&self, samples: &[f32]) -> [f32; N_MELS] {
-        let mut input: Vec<f32> = samples
+    /// One-tap preemphasis, `y[i] = x[i] - 0.97*x[i-1]`, applied to the raw signal
+    /// before any padding to match NeMo's ordering.
+    ///
+    /// `prev_raw` is an Option rather than a float plus a flag because "no
+    /// predecessor" is a genuinely different case from "predecessor was silence":
+    /// NeMo leaves the utterance's very first sample unfiltered.
+    fn preemphasise(&mut self, samples: &[f32]) -> Vec<f32> {
+        let out: Vec<f32> = samples
             .iter()
-            .zip(&self.window)
-            .map(|(s, w)| s * w)
+            .enumerate()
+            .map(|(i, &s)| {
+                let prev = if i == 0 {
+                    self.prev_raw
+                } else {
+                    Some(samples[i - 1])
+                };
+                match prev {
+                    None => s,
+                    Some(p) => s - PREEMPH * p,
+                }
+            })
             .collect();
-        let mut spectrum = self.fft.make_output_vec();
-        // Only fails on a length mismatch, and both lengths are compile-time
-        // constants checked by the planner above.
-        let _ = self.fft.process(&mut input, &mut spectrum);
+        if let Some(&lastraw) = samples.last() {
+            self.prev_raw = Some(lastraw);
+        }
+        out
+    }
+
+    fn frame(&mut self, samples: &[f32]) -> [f32; N_MELS] {
+        self.scratch_in.clear();
+        self.scratch_in
+            .extend(samples.iter().zip(&self.window).map(|(s, w)| s * w));
+        // Both lengths are compile-time constants agreed with the planner, so a
+        // failure here is a programming error — and this module's whole argument is
+        // that a wrong number must never pass silently. Swallowing it would hand
+        // back a zeroed spectrum and a plausible transcript.
+        self.fft
+            .process(&mut self.scratch_in, &mut self.scratch_out)
+            .expect("FFT length agreed with the planner at construction");
 
         // `magnitude_power_2_no_fft_normalization` — squared magnitude, and NO 1/N
         // scaling. realfft's forward transform is already unnormalised, so this is
         // the absence of a division rather than the presence of one.
-        let power: Vec<f32> = spectrum.iter().map(|c| c.re * c.re + c.im * c.im).collect();
-
         let mut mels = [0.0f32; N_MELS];
         // as_chunks over chunks_exact: N_BINS is a constant, so the remainder is
-        // provably empty and clippy is right to ask. Same idiom as engine.rs.
+        // provably empty. Same idiom as engine.rs.
         let (rows, remainder) = self.filters.as_chunks::<N_BINS>();
         debug_assert!(remainder.is_empty(), "filters validated as N_MELS*N_BINS");
         for (m, row) in mels.iter_mut().zip(rows) {
-            let energy: f32 = row.iter().zip(&power).map(|(f, p)| f * p).sum();
+            let energy: f32 = row
+                .iter()
+                .zip(&self.scratch_out)
+                .map(|(f, c)| f * (c.re * c.re + c.im * c.im))
+                .sum();
             *m = (energy + GUARD).ln();
         }
         // normalize: NA. There is deliberately no CMVN here — see the module docs.
@@ -200,10 +239,10 @@ impl Fbank {
 /// `np.pad(x, n, mode="reflect")` on the left edge: mirrors about `x[0]` without
 /// repeating it.
 ///
-/// Reflect needs `n + 1` samples to mirror. A shorter input is not an error — a
-/// user can stop a recording after two samples — so it degrades to whatever
-/// reflection is available and zero-fills the rest, which is what the model would
-/// see from silence anyway.
+/// Reflect needs `n + 1` samples to mirror. `push` will not call this with fewer
+/// except on a `last` that ends the utterance early, so the degraded zero-fill is
+/// reachable only for a recording shorter than 257 samples (16 ms), where there is
+/// no correct answer to give.
 fn reflect_pad_front(x: &[f32], n: usize) -> Vec<f32> {
     let mut out = vec![0.0; n];
     for k in 0..n.min(x.len().saturating_sub(1)) {
@@ -254,10 +293,38 @@ mod tests {
             .collect()
     }
 
+    fn one_shot(audio: &[f32]) -> Vec<[f32; N_MELS]> {
+        Fbank::new().unwrap().push(audio, true)
+    }
+
+    fn chunked(audio: &[f32], n: usize) -> Vec<[f32; N_MELS]> {
+        let mut fb = Fbank::new().unwrap();
+        let mut out = Vec::new();
+        let mut it = audio.chunks(n).peekable();
+        while let Some(c) = it.next() {
+            out.extend(fb.push(c, it.peek().is_none()));
+        }
+        out
+    }
+
+    fn assert_close(a: &[[f32; N_MELS]], b: &[[f32; N_MELS]], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}: frame count differs");
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            for bin in 0..N_MELS {
+                assert!(
+                    (x[bin] - y[bin]).abs() < 1e-3,
+                    "{what}: frame {i} bin {bin}: {} vs {}",
+                    x[bin],
+                    y[bin]
+                );
+            }
+        }
+    }
+
     #[test]
     fn matches_the_golden_frames() {
         let g = golden();
-        let mels = Fbank::new().unwrap().push(&lcg_noise(48_000), true);
+        let mels = one_shot(&lcg_noise(48_000));
         assert_eq!(
             mels.len(),
             g["shape"][1].as_u64().unwrap() as usize,
@@ -278,6 +345,20 @@ mod tests {
                 );
             }
         }
+
+        // Three sampled frames can miss drift the whole matrix would show, and the
+        // fixture already carries these.
+        let n = (mels.len() * N_MELS) as f64;
+        let mean = mels.iter().flatten().map(|v| *v as f64).sum::<f64>() / n;
+        let min = mels.iter().flatten().fold(f32::MAX, |a, b| a.min(*b)) as f64;
+        let max = mels.iter().flatten().fold(f32::MIN, |a, b| a.max(*b)) as f64;
+        for (name, got) in [("mean", mean), ("min", min), ("max", max)] {
+            let want = g["stats"][name].as_f64().unwrap();
+            assert!(
+                (got - want).abs() < 1e-3,
+                "stats.{name}: got {got}, want {want}"
+            );
+        }
     }
 
     /// The `normalize: NA` tripwire. Cheap, and it is the ONE feature-pipeline
@@ -288,9 +369,7 @@ mod tests {
     /// above are what does that.
     #[test]
     fn output_is_not_normalised() {
-        let mels = Fbank::new()
-            .unwrap()
-            .push(&crate::engine::synthetic_audio(3.0), true);
+        let mels = one_shot(&crate::engine::synthetic_audio(3.0));
         let n = (mels.len() * N_MELS) as f32;
         let mean = mels.iter().flatten().sum::<f32>() / n;
         assert!(
@@ -305,8 +384,8 @@ mod tests {
     #[test]
     fn empty_and_short_pushes_do_not_panic() {
         // 512 samples of centre-padding around nothing is still one whole frame.
-        // The property here is that it does not panic; an empty utterance
-        // producing a frame of silence is harmless.
+        // The property here is that it does not panic; an empty utterance producing
+        // a frame of silence is harmless.
         let mut fb = Fbank::new().unwrap();
         assert!(fb.push(&[], true).len() <= 1);
 
@@ -318,31 +397,23 @@ mod tests {
         fb.push(&[0.1, -0.2, 0.3], true); // shorter than one reflect pad
     }
 
-    /// Chunking must not change the answer. This is the property the 560 ms
-    /// streaming path depends on and the one the sample tail and preemphasis state
-    /// exist to preserve.
+    /// Chunking must not change the answer, at ANY chunk size.
+    ///
+    /// This is not hypothetical. An earlier version built the left reflect-pad from
+    /// whatever the first `push` happened to carry, so a first chunk under 256
+    /// samples zero-filled the pad instead of mirroring and corrupted frames 0-1 by
+    /// up to 3.57 log units — silently. The browser sends 8960 at a time and would
+    /// never have shown it; the offline path feeds arbitrary slices and would.
     #[test]
-    fn streaming_matches_one_shot() {
+    fn chunking_does_not_change_the_result() {
         let audio = crate::engine::synthetic_audio(2.0);
-        let one_shot = Fbank::new().unwrap().push(&audio, true);
+        let base = one_shot(&audio);
+        assert!(base.len() > 100, "sanity: expected a couple hundred frames");
 
-        let mut fb = Fbank::new().unwrap();
-        let mut streamed = Vec::new();
-        let mut chunks = audio.chunks(8960).peekable();
-        while let Some(c) = chunks.next() {
-            streamed.extend(fb.push(c, chunks.peek().is_none()));
-        }
-
-        assert_eq!(streamed.len(), one_shot.len(), "frame count differs");
-        for (i, (a, b)) in streamed.iter().zip(&one_shot).enumerate() {
-            for bin in 0..N_MELS {
-                assert!(
-                    (a[bin] - b[bin]).abs() < 1e-3,
-                    "frame {i} bin {bin}: streamed {} vs one-shot {}",
-                    a[bin],
-                    b[bin]
-                );
-            }
+        for n in [
+            1, 7, 159, 160, 161, 255, 256, 257, 1000, 8960, 32_000, 99_999,
+        ] {
+            assert_close(&chunked(&audio, n), &base, &format!("chunk size {n}"));
         }
     }
 }

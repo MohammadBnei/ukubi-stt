@@ -7,7 +7,7 @@ silently wrong numbers.
 
 | file | source | why it is here |
 |---|---|---|
-| `mel_filters_slaney_80x257.json` | [`PersianML/Shenava-Koochik-v1.0-ONNX-fp16`](https://huggingface.co/PersianML/Shenava-Koochik-v1.0-ONNX-fp16), rev `41603e4beed9c889700e6367a26be1d670d74cc9` | The exact Slaney mel filterbank the model was trained against. Recomputing `librosa.filters.mel(htk=False, norm='slaney')` is ~40 lines whose failure mode is a plausible-but-wrong matrix. |
+| `mel_filters_slaney_80x257.json` | [`PersianML/Shenava-Koochik-v1.0-ONNX-fp16`](https://huggingface.co/PersianML/Shenava-Koochik-v1.0-ONNX-fp16), rev `41603e4beed9c889700e6367a26be1d670d74cc9`, sha256 `327ad485dfcf1cbd9405ea6512aa0a788990a5c98ef14ba8585896cdc9749866` | The exact Slaney mel filterbank the model was trained against. Recomputing `librosa.filters.mel(htk=False, norm='slaney')` is ~40 lines whose failure mode is a plausible-but-wrong matrix. |
 | `golden_mel.json` | generated, see below | Test fixture for `src/fbank.rs`. |
 | `LICENSE-shenava` | the model repo | Apache-2.0. Fetched into the repo rather than onto the PVC, because `fetch-model.sh` fails closed on every file it lists and a licence file is not worth an outage. |
 
@@ -15,6 +15,16 @@ Note the filterbank comes from the **fp16** repo while `fetch-model.sh` pulls th
 **streaming** one. That is safe and not an accident: `export_manifest.json` names
 `shenava-koochik-1.0.nemo` as the source of both exports, and that `.nemo`'s
 `model_config.yaml` carries the single preprocessor definition both inherit.
+
+Verify the filterbank has not drifted from what upstream serves:
+
+```sh
+curl -sL https://huggingface.co/PersianML/Shenava-Koochik-v1.0-ONNX-fp16/resolve/main/mel_filters_slaney_80x257.json \
+  | shasum -a 256
+```
+
+A revision alone is not checkable once you have the file in hand, which is the
+whole reason to write the hash down next to it.
 
 ## Regenerating `golden_mel.json`
 

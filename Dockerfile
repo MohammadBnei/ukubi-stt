@@ -83,6 +83,10 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
 COPY build.rs ./
 COPY proto ./proto
 COPY web ./web
+# include_str!'d by src/fbank.rs (the mel filterbank and its golden fixture).
+# Missing this line compiles fine locally and fails only in the tag build, which
+# is a 15-minute round trip to learn about a one-line omission.
+COPY assets ./assets
 COPY src ./src
 # cargo fingerprints on content+mtime; the stub above already produced a binary,
 # so touch to force the real sources to compile over it.

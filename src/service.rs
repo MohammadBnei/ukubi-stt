@@ -499,7 +499,10 @@ async fn index() -> axum::response::Html<&'static str> {
 /// it matches `/` — not a prefix — so adding it does not expose /healthz.
 async fn capture_module() -> impl axum::response::IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
         include_str!("../web/stt-capture.js"),
     )
 }

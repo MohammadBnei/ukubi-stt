@@ -256,6 +256,13 @@ impl SttService {
         // session. `last` WITH audio still creates one — a recording shorter
         // than a single chunk sends exactly one request, with `last` set, and
         // dropping it would lose the whole utterance.
+        //
+        // Note `handle()` above still resolves first, so a bare close for an
+        // unknown session fails with FAILED_PRECONDITION on a pod where the
+        // streaming model cannot load. Left as is deliberately: hoisting a
+        // `contains_key` check above the await would race the idle sweep, and
+        // the case it fixes is a spurious error on an operation that had
+        // nothing to free anyway.
         let bare_close = last && samples.is_empty();
         let recognizer = match self.session(session_id, &handle, language, !bare_close)? {
             Some(r) => r,

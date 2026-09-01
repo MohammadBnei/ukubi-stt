@@ -12,7 +12,7 @@
   "release-it": {
     "$schema": "https://unpkg.com/release-it@19/schema/release-it.json",
     "hooks": {
-      "after:bump": "sed -i.bak 's/^version = \".*\"/version = \"${version}\"/' Cargo.toml && rm -f Cargo.toml.bak"
+      "after:bump": "sed -i.bak 's/^version = \".*\"/version = \"${version}\"/' Cargo.toml && rm -f Cargo.toml.bak && cargo update -p ukubi-stt --offline"
     },
     "git": {
       "commitMessage": "chore: release v${version}",

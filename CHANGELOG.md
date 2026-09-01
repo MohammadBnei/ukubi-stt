@@ -1,5 +1,12 @@
 # Changelog
 
+# [0.10.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.9.0...0.10.0) (2026-09-01)
+
+
+### Features
+
+* **stt:** route on language, and make Persian reachable ([#21](https://github.com/MohammadBnei/ukubi-stt/issues/21)) ([9de6042](https://github.com/MohammadBnei/ukubi-stt/commit/9de6042df582650f227c485650a2ce24d337cd55))
+
 # [0.9.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.8.0...0.9.0) (2026-09-01)
 
 

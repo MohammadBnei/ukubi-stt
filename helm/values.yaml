@@ -12,7 +12,7 @@ image:
   # minutes later, so a hand-edited tag deploys a pod that cannot pull — and
   # with `strategy: Recreate` the old pod is already gone, so it is an outage
   # rather than a no-op. Hit for real on 0.4.0.
-  tag: "0.8.0"
+  tag: "0.9.0"
   pullPolicy: IfNotPresent
 
 replicaCount: 1

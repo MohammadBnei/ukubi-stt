@@ -4,6 +4,7 @@
 use crate::engine::{
     is_multilingual, load_streaming_and_assert_cuda, pcm_s16le_to_f32, SAMPLE_RATE,
 };
+use crate::persian::{PersianModel, PersianStream};
 use parakeet_rs::{Nemotron, NemotronHandle, ParakeetTDT, Transcriber};
 use std::{
     collections::HashMap,
@@ -76,8 +77,110 @@ fn max_sessions() -> usize {
 const SESSION_IDLE: Duration = Duration::from_secs(120);
 
 struct Session {
-    recognizer: Arc<Mutex<Nemotron>>,
+    recognizer: Arc<Mutex<Recognizer>>,
+    /// Which engine opened this session. A client that changes `language`
+    /// mid-stream would otherwise keep decoding on the model it started with —
+    /// harmless when that only picked a prompt, wrong once it picks a MODEL.
+    engine: Engine,
     last_used: Instant,
+}
+
+/// Which streaming model handles a language.
+///
+/// An enum rather than a trait: the set is closed (a fourth model is a change in
+/// this repo either way), `dyn` would buy dispatch nobody needs, and the two
+/// engines do not sit honestly behind one interface — Nemotron pads at SAMPLE
+/// granularity from `chunk_samples()`, Persian at FRAME granularity with a
+/// true-length input. An exhaustive `match` also makes a fourth model a compile
+/// error at every decision point, which is the same instinct as engine.rs's
+/// `assert_send` block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Engine {
+    Nemotron,
+    Persian,
+}
+
+/// A loaded model, ready to spawn per-session recognizers from.
+enum Loaded {
+    Nemotron(NemotronHandle),
+    Persian(Arc<Mutex<PersianModel>>),
+}
+
+/// One session's recogniser.
+///
+/// The variants differ by ~320 bytes and clippy would rather one were boxed. It
+/// is not worth it: `max_sessions` is 8, so the worst case is 2.5 KB of slack for
+/// the whole process, against an allocation and a pointer chase on every decode.
+#[allow(clippy::large_enum_variant)]
+enum Recognizer {
+    Nemotron { rec: Nemotron, chunk: usize },
+    Persian(PersianStream),
+}
+
+impl Recognizer {
+    fn transcribe(&mut self, mut samples: Vec<f32>, last: bool) -> anyhow::Result<String> {
+        match self {
+            Recognizer::Nemotron { rec, chunk } => {
+                // FLUSH THE TAIL. The encoder emits only on a COMPLETE chunk, so a
+                // final partial one is buffered and never decoded — measured live
+                // on 2026-08-31, where a 9.23s utterance ended "...on an NVIDIA G"
+                // and lost its last 270ms. Every utterance would lose its ending.
+                //
+                // Padding with silence to the next chunk boundary makes the
+                // buffered audio a whole chunk, and the extra full chunk after it
+                // pushes the model's right-context window past the real speech.
+                // Silence decodes to nothing, so the cost is one ~25ms decode and
+                // no spurious text.
+                if last {
+                    let remainder = samples.len() % *chunk;
+                    if remainder != 0 {
+                        samples.resize(samples.len() + (*chunk - remainder), 0.0);
+                    }
+                    samples.resize(samples.len() + *chunk, 0.0);
+                }
+                rec.transcribe_chunk(&samples)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            }
+            // Persian pads inside its own feature extractor, at frame granularity
+            // and with a true-length input, so `last` needs no sample arithmetic
+            // here.
+            Recognizer::Persian(stream) => stream.push(&samples, last),
+        }
+    }
+}
+
+/// The prompt dictionary's own spelling of a language, or `None`.
+///
+/// `set_target_lang` matches exactly — no case folding, no separator handling —
+/// so `ar_AR` and `AR-AR` are rejected by it even though they name a language it
+/// knows. Resolving here means the caller's spelling never reaches the model.
+fn canonical_language(handle: &NemotronHandle, language: &str) -> Option<&'static str> {
+    let want = language.replace('_', "-");
+    handle
+        .available_languages()
+        .into_iter()
+        .find(|known| known.eq_ignore_ascii_case(&want))
+}
+
+/// Which engine a language belongs to.
+///
+/// Normalised on the primary subtag because callers send `fa`, `fa-IR`, `fa_IR`
+/// and `FA`. Matching whole locale strings is a bug generator.
+///
+/// ponytail: one arm. A table when there are three.
+fn engine_for(language: &str) -> Engine {
+    let primary = language
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match primary.as_str() {
+        // fa-AF / Dari is deliberately included: the model is Iranian-Persian
+        // fine-tuned, but Nemotron has no Persian at all, so routing it here is
+        // strictly better than the <unk> soup it gets today.
+        "fa" | "prs" => Engine::Persian,
+        _ => Engine::Nemotron,
+    }
 }
 
 /// Recover rather than propagate a poisoned mutex.
@@ -114,12 +217,18 @@ pub struct SttService {
     /// load `await` — which also means concurrent first-requests wait on one
     /// load instead of racing to start several.
     stream_handle: Arc<tokio::sync::Mutex<Option<NemotronHandle>>>,
+    fa_dir: PathBuf,
+    /// The Persian model, lazily loaded like the streaming one and for the same
+    /// reason. It runs on the ORT **CPU** provider (ADR-0047 Decision 3): measured
+    /// at 44.8ms per 1.12s step, which is 4% duty per stream, so it costs the card
+    /// nothing on a GPU already holding 6880 MiB of 8192.
+    fa_model: Arc<tokio::sync::Mutex<Option<Arc<Mutex<PersianModel>>>>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     max_sessions: usize,
 }
 
 impl SttService {
-    pub fn new(model: ParakeetTDT, stream_dir: PathBuf) -> Self {
+    pub fn new(model: ParakeetTDT, stream_dir: PathBuf, fa_dir: PathBuf) -> Self {
         let max_sessions = max_sessions();
         tracing::info!(max_sessions, "streaming session cap");
         Self {
@@ -127,6 +236,8 @@ impl SttService {
             permits: Arc::new(tokio::sync::Semaphore::new(1)),
             stream_dir,
             stream_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            fa_dir,
+            fa_model: Arc::new(tokio::sync::Mutex::new(None)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             max_sessions,
         }
@@ -174,6 +285,38 @@ impl SttService {
         Ok(handle)
     }
 
+    /// The Persian model, loaded on first use.
+    ///
+    /// A separate lock from `stream_handle` rather than one shared load mutex.
+    /// That would matter if both loads raced the whole-GPU delta assertion — but
+    /// Persian runs on the CPU provider and measures no GPU at all, so there is
+    /// nothing for a concurrent Nemotron load to corrupt.
+    async fn fa_model(&self) -> Result<Arc<Mutex<PersianModel>>, Status> {
+        let mut guard = self.fa_model.lock().await;
+        if let Some(m) = guard.as_ref() {
+            return Ok(Arc::clone(m));
+        }
+        let dir = self.fa_dir.clone();
+        let model = tokio::task::spawn_blocking(move || {
+            PersianModel::load(&dir, crate::persian::Device::Cpu)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Persian model load task failed: {e}")))?
+        .map_err(|e| Status::failed_precondition(format!("{e:#}")))?;
+        let model = Arc::new(Mutex::new(model));
+        *guard = Some(Arc::clone(&model));
+        tracing::info!("Persian model loaded (CPU)");
+        Ok(model)
+    }
+
+    /// The loaded model for an engine.
+    async fn loaded(&self, engine: Engine) -> Result<Loaded, Status> {
+        Ok(match engine {
+            Engine::Nemotron => Loaded::Nemotron(self.handle().await?),
+            Engine::Persian => Loaded::Persian(self.fa_model().await?),
+        })
+    }
+
     /// Find or create the recognizer for a session, sweeping idle ones first.
     ///
     /// The sweep can drop a session that a request is still decoding on. That is
@@ -194,10 +337,11 @@ impl SttService {
     fn session(
         &self,
         id: &str,
-        handle: &NemotronHandle,
+        loaded: &Loaded,
+        engine: Engine,
         language: &str,
         create: bool,
-    ) -> Result<Option<Arc<Mutex<Nemotron>>>, Status> {
+    ) -> Result<Option<Arc<Mutex<Recognizer>>>, Status> {
         let mut map = lock(&self.sessions);
         let now = Instant::now();
         let before = map.len();
@@ -207,6 +351,17 @@ impl SttService {
         }
 
         if let Some(existing) = map.get_mut(id) {
+            // Changing language mid-session is already ignored today, because the
+            // recognizer is only built once. With routing it would silently keep
+            // decoding on the WRONG MODEL, which is the failure this whole change
+            // exists to remove — so say so instead.
+            if existing.engine != engine {
+                return Err(Status::invalid_argument(format!(
+                    "session {id} was opened for {:?} and cannot switch to {engine:?} \
+                     mid-stream — close it with `last: true` and open a new session_id",
+                    existing.engine
+                )));
+            }
             existing.last_used = now;
             return Ok(Some(Arc::clone(&existing.recognizer)));
         }
@@ -221,30 +376,54 @@ impl SttService {
             )));
         }
 
-        let mut recognizer = Nemotron::from_shared(handle);
-        // Naming the language is strictly more accurate than letting the model
-        // guess, but only the multilingual export can be told — on the
-        // English-only build the call is a no-op, so it is gated rather than
-        // attempted and swallowed.
-        if is_multilingual(handle) && !language.is_empty() && language != "auto" {
-            recognizer.set_target_lang(language).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "language {language:?} is not one this model knows: {e}"
-                ))
-            })?;
-        }
+        let recognizer = match loaded {
+            Loaded::Nemotron(handle) => {
+                let mut rec = Nemotron::from_shared(handle);
+                // Naming the language is strictly more accurate than letting the
+                // model guess, but only the multilingual export can be told — on
+                // the English-only build the call is a no-op, so it is gated
+                // rather than attempted and swallowed.
+                if is_multilingual(handle) && !language.is_empty() && language != "auto" {
+                    // `set_target_lang` is an EXACT string match against the
+                    // prompt dictionary. Normalising only the routing predicate
+                    // would let `ar_AR` route correctly and then fail here, where
+                    // today it decodes — so the canonical spelling is resolved
+                    // before the call, not after.
+                    let canonical = canonical_language(handle, language).ok_or_else(|| {
+                        Status::invalid_argument(format!(
+                            "language {language:?} is not one this model knows"
+                        ))
+                    })?;
+                    rec.set_target_lang(canonical).map_err(|e| {
+                        Status::invalid_argument(format!(
+                            "language {language:?} is not one this model knows: {e}"
+                        ))
+                    })?;
+                }
+                Recognizer::Nemotron {
+                    rec,
+                    chunk: handle.chunk_samples(),
+                }
+            }
+            // The Persian model is monolingual and has no language knob, so
+            // `language` is deliberately ignored rather than validated — copying
+            // the Nemotron arm here would reject perfectly good `fa-XX` requests.
+            Loaded::Persian(model) => Recognizer::Persian(PersianStream::new(Arc::clone(model))),
+        };
 
         let recognizer = Arc::new(Mutex::new(recognizer));
         map.insert(
             id.to_string(),
             Session {
                 recognizer: Arc::clone(&recognizer),
+                engine,
                 last_used: now,
             },
         );
         tracing::info!(
             session = id,
             sessions = map.len(),
+            engine = ?engine,
             "streaming session opened"
         );
         Ok(Some(recognizer))
@@ -282,9 +461,9 @@ impl SttService {
         session_id: &str,
         language: &str,
         last: bool,
-        mut samples: Vec<f32>,
+        samples: Vec<f32>,
     ) -> Result<String, Status> {
-        let handle = self.handle().await?;
+        let engine = engine_for(language);
 
         // A close carrying no audio is the only case that must not open a
         // session. `last` WITH audio still creates one — a recording shorter
@@ -298,7 +477,45 @@ impl SttService {
         // the case it fixes is a spurious error on an operation that had
         // nothing to free anyway.
         let bare_close = last && samples.is_empty();
-        let recognizer = match self.session(session_id, &handle, language, !bare_close)? {
+
+        // Resolving the model BEFORE the session lookup would make a bare close
+        // for an unknown session load a 459MB model in order to close nothing.
+        // Look the session up first; only a create needs a loaded model.
+        if bare_close {
+            let existing = {
+                let mut map = lock(&self.sessions);
+                map.get_mut(session_id).map(|s| {
+                    s.last_used = Instant::now();
+                    (Arc::clone(&s.recognizer), s.engine)
+                })
+            };
+            let Some((recognizer, existing_engine)) = existing else {
+                tracing::info!(
+                    session = session_id,
+                    "close for a session already swept or never opened; nothing to flush"
+                );
+                return Ok(String::new());
+            };
+            let _ = existing_engine;
+            let text =
+                tokio::task::spawn_blocking(move || lock(&recognizer).transcribe(samples, true))
+                    .await
+                    .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
+                    .map_err(|e| {
+                        Status::internal(format!("streaming transcription failed: {e}"))
+                    })?;
+            let mut map = lock(&self.sessions);
+            map.remove(session_id);
+            tracing::info!(
+                session = session_id,
+                sessions = map.len(),
+                "streaming session closed"
+            );
+            return Ok(text);
+        }
+
+        let loaded = self.loaded(engine).await?;
+        let recognizer = match self.session(session_id, &loaded, engine, language, !bare_close)? {
             Some(r) => r,
             None => {
                 tracing::info!(
@@ -309,33 +526,13 @@ impl SttService {
             }
         };
 
-        // FLUSH THE TAIL. The encoder emits only on a COMPLETE chunk, so a
-        // final partial one is buffered and never decoded — measured live on
-        // 2026-08-31, where a 9.23s utterance ended "...on an NVIDIA G" and lost
-        // its last 270ms. Every utterance would lose its ending.
-        //
-        // Padding with silence to the next chunk boundary makes the buffered
-        // audio a whole chunk, and the extra full chunk after it pushes the
-        // model's right-context window past the real speech. Silence decodes to
-        // nothing, so the cost is one ~25ms decode and no spurious text.
-        //
-        // Done here rather than in the client because `last` already means
-        // exactly this, and a client that forgot would lose words with no
-        // symptom other than a slightly short transcript.
-        if last {
-            let chunk = handle.chunk_samples();
-            let remainder = samples.len() % chunk;
-            if remainder != 0 {
-                samples.resize(samples.len() + (chunk - remainder), 0.0);
-            }
-            samples.resize(samples.len() + chunk, 0.0);
-        }
-
-        let text =
-            tokio::task::spawn_blocking(move || lock(&recognizer).transcribe_chunk(&samples))
-                .await
-                .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
-                .map_err(|e| Status::internal(format!("streaming transcription failed: {e}")))?;
+        // The `last` flush lives in Recognizer::transcribe now: it is per-engine
+        // arithmetic (samples for Nemotron, frames for Persian) and belongs next
+        // to the model whose behaviour it describes.
+        let text = tokio::task::spawn_blocking(move || lock(&recognizer).transcribe(samples, last))
+            .await
+            .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
+            .map_err(|e| Status::internal(format!("streaming transcription failed: {e}")))?;
 
         if last {
             let mut map = lock(&self.sessions);
@@ -568,6 +765,29 @@ mod tests {
 
     // ponytail: the parsing branch only. Everything else in this module needs a
     // loaded model and a GPU.
+    #[test]
+    fn engine_for_normalises_the_primary_subtag() {
+        // Callers send every one of these spellings.
+        for fa in ["fa", "fa-IR", "fa_IR", "FA", "Fa-Ir", "fa-AF", "prs"] {
+            assert_eq!(
+                engine_for(fa),
+                Engine::Persian,
+                "{fa} should route to Persian"
+            );
+        }
+        // Everything else, including the empty string, stays on the multilingual
+        // model — which is what makes today's auto-detect behaviour unchanged.
+        for other in [
+            "", "auto", "en", "en-US", "ar", "ar-AR", "ar_AR", "fr-FR", "farsi",
+        ] {
+            assert_eq!(
+                engine_for(other),
+                Engine::Nemotron,
+                "{other} should stay on Nemotron"
+            );
+        }
+    }
+
     #[test]
     fn max_sessions_falls_back_rather_than_obeying_nonsense() {
         assert_eq!(parse_max_sessions(None), DEFAULT_MAX_SESSIONS);

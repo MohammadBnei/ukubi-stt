@@ -36,6 +36,7 @@ use ort::session::Session;
 use ort::value::Tensor;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// Log-mel frames consumed per step, and how far the window advances. The 9-frame
 /// difference is the pre-encode overlap the graph needs to see and then discards.
@@ -66,7 +67,9 @@ pub enum Device {
 
 pub struct PersianModel {
     session: Session,
-    tokens: Vec<String>,
+    /// Behind an `Arc` so a decode can hold the vocabulary after releasing the
+    /// session lock — 1025 Strings, cloned once at load rather than per step.
+    tokens: Arc<Vec<String>>,
 }
 
 impl PersianModel {
@@ -122,13 +125,23 @@ impl PersianModel {
             }
         }
 
-        Ok(Self { session, tokens })
+        Ok(Self {
+            session,
+            tokens: Arc::new(tokens),
+        })
     }
 }
 
 /// One dictation. Holds the recogniser state that makes a stream a stream: the
 /// encoder caches, the feature extractor's sample tail, and the last emitted token.
 pub struct PersianStream {
+    /// One session shared by every Persian stream. `Session::run` takes
+    /// `&mut self`, so this serialises Persian inference — at 44.8 ms per 1.12 s
+    /// step that is 4% duty per stream, so roughly 25 streams before the lock is
+    /// the limit, against a session cap of 8.
+    ///
+    /// ponytail: one shared session. A second only if that ceiling is ever hit.
+    model: Arc<Mutex<PersianModel>>,
     fbank: Fbank,
     frames: VecDeque<[f32; N_MELS]>,
     cache_ch: Vec<f32>,
@@ -144,15 +157,10 @@ pub struct PersianStream {
     finished: bool,
 }
 
-impl Default for PersianStream {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl PersianStream {
-    pub fn new() -> Self {
+    pub fn new(model: Arc<Mutex<PersianModel>>) -> Self {
         Self {
+            model,
             fbank: Fbank::new().expect("bundled filterbank is valid; checked by a unit test"),
             frames: VecDeque::new(),
             cache_ch: vec![0.0; CACHE_CH.iter().product()],
@@ -174,12 +182,7 @@ impl PersianStream {
     /// That is normal and frequent: clients send 560 ms chunks and a step needs
     /// 1.12 s, so the first two calls of a dictation produce nothing and roughly
     /// every other one after that does. Callers concatenate.
-    pub fn push(
-        &mut self,
-        model: &mut PersianModel,
-        samples: &[f32],
-        last: bool,
-    ) -> Result<String> {
+    pub fn push(&mut self, samples: &[f32], last: bool) -> Result<String> {
         if self.finished {
             bail!("this Persian stream was already closed with last: true");
         }
@@ -197,7 +200,7 @@ impl PersianStream {
                     window[m * CHUNK_FRAMES + t] = *v;
                 }
             }
-            text.push_str(&self.step(model, window, take)?);
+            text.push_str(&self.step(window, take)?);
 
             for _ in 0..SHIFT_FRAMES.min(self.frames.len()) {
                 self.frames.pop_front();
@@ -213,15 +216,20 @@ impl PersianStream {
         Ok(text)
     }
 
-    fn step(
-        &mut self,
-        model: &mut PersianModel,
-        window: Vec<f32>,
-        true_frames: usize,
-    ) -> Result<String> {
-        let outputs = model
-            .session
-            .run(ort::inputs![
+    fn step(&mut self, window: Vec<f32>, true_frames: usize) -> Result<String> {
+        // The lock is held across this one ~45 ms inference and nothing else.
+        // Never across a whole request: one shared session means a batch decode
+        // holding it for minutes would freeze every live dictation.
+        let shared = Arc::clone(&self.model);
+        let mut model = shared.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Persian model mutex was poisoned by a panic; recovering");
+            poisoned.into_inner()
+        });
+
+        let (vocab, usable, logprobs, cache_ch, cache_t, cache_len) = {
+            let outputs = model
+                .session
+                .run(ort::inputs![
                 "audio_signal" => Tensor::from_array(([1usize, N_MELS, CHUNK_FRAMES], window))?,
                 // The padded window is always CHUNK_FRAMES wide; `length` is what
                 // tells the encoder how much of it is real, and `encoded_lengths`
@@ -230,30 +238,45 @@ impl PersianStream {
                 "cache_last_channel" => Tensor::from_array((CACHE_CH, std::mem::take(&mut self.cache_ch)))?,
                 "cache_last_time" => Tensor::from_array((CACHE_T, std::mem::take(&mut self.cache_t)))?,
                 "cache_last_channel_len" => Tensor::from_array(([1usize], vec![self.cache_len]))?,
-            ])
-            .context("Persian encoder step")?;
+                ])
+                .context("Persian encoder step")?;
 
-        let (lp_shape, logprobs) = outputs["logprobs"].try_extract_tensor::<f32>()?;
-        let steps = lp_shape[1] as usize;
-        let vocab = lp_shape[2] as usize;
-        if vocab != VOCAB {
-            bail!("Persian model emitted a {vocab}-wide vocabulary, expected {VOCAB}");
-        }
-        let (_, enc_len) = outputs["encoded_lengths"].try_extract_tensor::<i64>()?;
-        let usable = steps.min(enc_len[0].max(0) as usize);
+            let (lp_shape, logprobs) = outputs["logprobs"].try_extract_tensor::<f32>()?;
+            let steps = lp_shape[1] as usize;
+            let vocab = lp_shape[2] as usize;
+            if vocab != VOCAB {
+                bail!("Persian model emitted a {vocab}-wide vocabulary, expected {VOCAB}");
+            }
+            let (_, enc_len) = outputs["encoded_lengths"].try_extract_tensor::<i64>()?;
+            let usable = steps.min(enc_len[0].max(0) as usize);
 
-        let text = self.decode(&model.tokens, logprobs, usable, vocab);
+            // Copied out so the session borrow ends here and the lock can be
+            // released before the decode, which needs no model state.
+            let (_, ch) = outputs["cache_last_channel_next"].try_extract_tensor::<f32>()?;
+            let (_, t) = outputs["cache_last_time_next"].try_extract_tensor::<f32>()?;
+            let (_, len) = outputs["cache_last_channel_next_len"].try_extract_tensor::<i64>()?;
+            (
+                vocab,
+                usable,
+                logprobs.to_vec(),
+                ch.to_vec(),
+                t.to_vec(),
+                len[0],
+            )
+        };
 
         // Thread the caches forward. They are the stream's entire memory of the
         // utterance; `cache_last_channel_len` saturates at 70 by itself.
-        let (_, ch) = outputs["cache_last_channel_next"].try_extract_tensor::<f32>()?;
-        let (_, t) = outputs["cache_last_time_next"].try_extract_tensor::<f32>()?;
-        let (_, len) = outputs["cache_last_channel_next_len"].try_extract_tensor::<i64>()?;
-        self.cache_ch = ch.to_vec();
-        self.cache_t = t.to_vec();
-        self.cache_len = len[0];
+        self.cache_ch = cache_ch;
+        self.cache_t = cache_t;
+        self.cache_len = cache_len;
 
-        Ok(text)
+        // Cheap: an Arc bump, not 1025 String clones. Releasing the lock before
+        // the decode keeps the shared session free for other streams.
+        let tokens = Arc::clone(&model.tokens);
+        drop(model);
+
+        Ok(self.decode(&tokens, &logprobs, usable, vocab))
     }
 
     /// Greedy CTC: argmax per step, drop blanks, drop repeats, drop specials, then

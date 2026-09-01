@@ -60,4 +60,15 @@ fetch "${STT_STREAM_MODEL_DIR:-/models/nemotron}" \
       "${NEMOTRON_REPO:-tonythethompson/Nemotron-3.5-ASR-Streaming-0.6B-ONNX}" \
       "encoder.onnx encoder.onnx.data decoder_joint.onnx tokenizer.model"
 
-ls -la "${STT_MODEL_DIR:-/models/tdt}" "${STT_STREAM_MODEL_DIR:-/models/nemotron}"
+# Persian (ADR-0047). One file, no .onnx.data sidecar unlike the other two.
+#
+# Deliberately NOT fetching LICENSE: this function treats every listed file as a
+# completeness sentinel under `set -eu`, so a cosmetic file would become a hard
+# dependency of pod startup and an upstream rename would abort the init container.
+# The licence ships in the image instead, under assets/.
+fetch "${STT_FA_MODEL_DIR:-/models/shenava}" \
+      "${SHENAVA_REPO:-PersianML/Shenava-Koochik-v1.0-tract-streaming}" \
+      "model.onnx tokens.txt"
+
+ls -la "${STT_MODEL_DIR:-/models/tdt}" "${STT_STREAM_MODEL_DIR:-/models/nemotron}" \
+       "${STT_FA_MODEL_DIR:-/models/shenava}"

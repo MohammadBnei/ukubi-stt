@@ -148,12 +148,23 @@ impl SttService {
     /// only means the next chunk starts fresh. Preferable to holding the map
     /// lock across a decode, which would serialise every stream against every
     /// other one.
+    /// `create: false` looks up without opening a new recognizer, returning
+    /// `None` when there is nothing there.
+    ///
+    /// That distinction exists because a **bare close must never create a
+    /// session**. Opening one only to delete it is wasteful when the cap has
+    /// room and actively harmful when it does not: the create is refused with
+    /// RESOURCE_EXHAUSTED, so the close fails and the slot it was freeing
+    /// leaks. A full cap then stays full — every subsequent close hits the same
+    /// wall. Found by adversarial review of the consumer-integration plan, not
+    /// by running it.
     fn session(
         &self,
         id: &str,
         handle: &NemotronHandle,
         language: &str,
-    ) -> Result<Arc<Mutex<Nemotron>>, Status> {
+        create: bool,
+    ) -> Result<Option<Arc<Mutex<Nemotron>>>, Status> {
         let mut map = lock(&self.sessions);
         let now = Instant::now();
         let before = map.len();
@@ -164,7 +175,10 @@ impl SttService {
 
         if let Some(existing) = map.get_mut(id) {
             existing.last_used = now;
-            return Ok(Arc::clone(&existing.recognizer));
+            return Ok(Some(Arc::clone(&existing.recognizer)));
+        }
+        if !create {
+            return Ok(None);
         }
         if map.len() >= MAX_SESSIONS {
             return Err(Status::resource_exhausted(format!(
@@ -199,7 +213,7 @@ impl SttService {
             sessions = map.len(),
             "streaming session opened"
         );
-        Ok(recognizer)
+        Ok(Some(recognizer))
     }
 
     /// Whole-utterance decode against the batch model, one at a time.
@@ -237,7 +251,29 @@ impl SttService {
         mut samples: Vec<f32>,
     ) -> Result<String, Status> {
         let handle = self.handle().await?;
-        let recognizer = self.session(session_id, &handle, language)?;
+
+        // A close carrying no audio is the only case that must not open a
+        // session. `last` WITH audio still creates one — a recording shorter
+        // than a single chunk sends exactly one request, with `last` set, and
+        // dropping it would lose the whole utterance.
+        //
+        // Note `handle()` above still resolves first, so a bare close for an
+        // unknown session fails with FAILED_PRECONDITION on a pod where the
+        // streaming model cannot load. Left as is deliberately: hoisting a
+        // `contains_key` check above the await would race the idle sweep, and
+        // the case it fixes is a spurious error on an operation that had
+        // nothing to free anyway.
+        let bare_close = last && samples.is_empty();
+        let recognizer = match self.session(session_id, &handle, language, !bare_close)? {
+            Some(r) => r,
+            None => {
+                tracing::info!(
+                    session = session_id,
+                    "close for a session already swept or never opened; nothing to flush"
+                );
+                return Ok(String::new());
+            }
+        };
 
         // FLUSH THE TAIL. The encoder emits only on a COMPLETE chunk, so a
         // final partial one is buffered and never decoded — measured live on

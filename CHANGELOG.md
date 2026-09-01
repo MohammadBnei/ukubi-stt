@@ -1,5 +1,12 @@
 # Changelog
 
+# [0.8.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.7.0...0.8.0) (2026-09-01)
+
+
+### Features
+
+* **web:** prewarm the audio graph so the first words are captured ([#15](https://github.com/MohammadBnei/ukubi-stt/issues/15)) ([ca81ca2](https://github.com/MohammadBnei/ukubi-stt/commit/ca81ca2d0622aec9166a265d424912d8af6bd2b3))
+
 # [0.7.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.6.0...0.7.0) (2026-09-01)
 
 

@@ -72,10 +72,17 @@ limitRange:
 # disk with agent-fleet's session volumes.
 persistence:
   enabled: true
-  # Two models now: TDT 2.49GB + Nemotron 2.59GB = ~5.1GB (ADR-0046). Note
+  # Three models now: TDT 2.4GB + Nemotron 2.5GB + Shenava 0.44GB = ~5.4GB
+  # (ADR-0046, ADR-0047). Note
   # local-path does not enforce quotas, so this claim is advisory — the real
   # constraint is k8s-worker-01's OS disk, shared with agent-fleet's session
-  # volumes.
+  # volumes (19GB free of 96GB as of 2026-09-01).
+  #
+  # AND IT IS FICTION IN A SECOND WAY: the bound PVC is 8Gi, not 12Gi. local-path
+  # cannot expand, so raising this number never took effect and never will for the
+  # existing claim — changing it would need the PVC deleted and the models
+  # re-downloaded. Left at 12Gi so a rebuilt node gets the larger claim; do not
+  # read it as what is mounted today.
   size: 12Gi
   storageClass: local-path
   mountPath: /models
@@ -99,6 +106,8 @@ initContainers:
         value: /models/tdt
       - name: STT_STREAM_MODEL_DIR
         value: /models/nemotron
+      - name: STT_FA_MODEL_DIR
+        value: /models/shenava
     volumeMounts:
       - name: data
         mountPath: /models
@@ -115,6 +124,10 @@ env:
   # batch service rather than a failed upgrade. ADR-0046 Decision 2.
   - name: STT_STREAM_MODEL_DIR
     value: /models/nemotron
+  # Persian, ADR-0047. Runs on the ORT CPU provider and touches no GPU memory:
+  # 44.8ms per 1.12s step measured on k8s-worker-01, i.e. 4% duty per stream.
+  - name: STT_FA_MODEL_DIR
+    value: /models/shenava
   # Concurrent streaming sessions, cluster-wide. Default 8 if unset.
   #
   # The binding constraint is GPU duty cycle — each stream occupies the card for

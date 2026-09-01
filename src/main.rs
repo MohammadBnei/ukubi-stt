@@ -63,7 +63,7 @@ fn main() -> Result<()> {
             "unknown argument {other:?} — expected --selftest [wav], --selftest-stream, \
              or --selftest-fa [wav] [reference text]"
         ),
-        None => serve(&model_dir, stream_dir),
+        None => serve(&model_dir, stream_dir, fa_dir),
     }
 }
 
@@ -119,7 +119,9 @@ fn selftest_fa(
     println!("device         : {device:?}");
 
     let baseline = engine::gpu_used_mib().ok();
-    let mut model = persian::PersianModel::load(fa_dir, device)?;
+    let model = std::sync::Arc::new(std::sync::Mutex::new(persian::PersianModel::load(
+        fa_dir, device,
+    )?));
     if let (Some(before), Some(after)) = (baseline, engine::gpu_used_mib().ok()) {
         println!("gpu delta      : {} MiB", after.saturating_sub(before));
     }
@@ -133,13 +135,13 @@ fn selftest_fa(
 
     // Fed in 560 ms chunks, which is exactly what the browser sends. Decoding it in
     // one call would exercise a path no client uses.
-    let mut stream = persian::PersianStream::new();
+    let mut stream = persian::PersianStream::new(std::sync::Arc::clone(&model));
     let started = std::time::Instant::now();
     let mut text = String::new();
     let mut steps = 0usize;
     let mut chunks = samples.chunks(8960).peekable();
     while let Some(chunk) = chunks.next() {
-        let out = stream.push(&mut model, chunk, chunks.peek().is_none())?;
+        let out = stream.push(chunk, chunks.peek().is_none())?;
         if !out.is_empty() {
             steps += 1;
         }
@@ -243,7 +245,7 @@ fn selftest(model_dir: &std::path::Path, audio: Option<PathBuf>) -> Result<()> {
 /// Blocking `main` on purpose: the model loads and CUDA is asserted *before*
 /// any runtime or listener exists. There is no window in which this process is
 /// reachable but cannot decode.
-fn serve(model_dir: &std::path::Path, stream_dir: PathBuf) -> Result<()> {
+fn serve(model_dir: &std::path::Path, stream_dir: PathBuf, fa_dir: PathBuf) -> Result<()> {
     // Read before the expensive part. A credential problem is a config error and
     // should not cost a 2.4GB model load and a CUDA context to discover.
     let auth = service::BearerAuth::from_env()?;
@@ -266,7 +268,7 @@ fn serve(model_dir: &std::path::Path, stream_dir: PathBuf) -> Result<()> {
             // Shared so a background task can warm the streaming model while the
             // server is already accepting traffic. from_arc rather than new()
             // exists for exactly this.
-            let svc = std::sync::Arc::new(service::SttService::new(model, stream_dir));
+            let svc = std::sync::Arc::new(service::SttService::new(model, stream_dir, fa_dir));
             let warm = std::sync::Arc::clone(&svc);
             tokio::spawn(async move { warm.warm_streaming().await });
 

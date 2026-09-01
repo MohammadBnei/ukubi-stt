@@ -89,12 +89,21 @@
 
   <div class="card hidden" id="mic">
     <div class="row">
+      <select id="lang" title="RecognitionConfig.language">
+        <option value="">auto-detect</option>
+        <option value="fa-IR">فارسی — Persian</option>
+        <option value="ar-AR">العربية — Arabic</option>
+        <option value="en-US">English</option>
+        <option value="fr-FR">Français</option>
+      </select>
       <button id="rec">Record</button>
       <button class="ghost" id="pick">Send a WAV file</button>
       <button class="ghost" id="clear">Clear</button>
       <input type="file" id="file" accept="audio/*,.wav" class="hidden">
     </div>
     <div id="meter"><div id="meterbar"></div></div>
+    <p class="hint"><b>Persian needs to be selected</b> — it is a separate model and
+      auto-detect cannot reach it. Arabic and the European languages are auto-detected.</p>
     <p class="hint"><b>Record</b> streams: <span id="chunklen">560</span>ms chunks carrying a
       session id, decoded by a model that keeps its encoder state between them, so text appears
       about half a second behind you. <b>Send a WAV</b> goes as one offline decode against the
@@ -102,7 +111,7 @@
       that for latency, and a file does not need the trade.</p>
   </div>
 
-  <div class="card hidden" id="out">
+  <div class="card hidden" id="out" dir="auto">
     <label>Transcript</label>
     <div id="transcript"></div>
     <div class="stats">
@@ -166,7 +175,15 @@ function lenDelimited(fieldNo, bytes) {
 // An empty session_id means a one-shot offline decode against the batch model;
 // a non-empty one continues a server-side streaming recognizer.
 function encodeRequest(pcm, sessionId, last) {
+  // RecognitionConfig { int32 sample_rate_hertz = 1; string language = 2; }
+  //
+  // `language` is the ROUTING KEY, not a hint: Persian is a different model, so
+  // unlike Arabic it cannot be reached by auto-detect. Leave the selector on
+  // auto and Persian audio goes to the multilingual model, which has a prompt
+  // slot for it that it was never trained on, and returns <unk>.
   const config = [(1 << 3) | 0, ...varint(SAMPLE_RATE)];
+  const lang = document.getElementById('lang').value;
+  if (lang) config.push(...lenDelimited(2, new TextEncoder().encode(lang)));
   let head = [...lenDelimited(1, config)];
   if (sessionId) head.push(...lenDelimited(3, new TextEncoder().encode(sessionId)));
   if (last) head.push((5 << 3) | 0, 1);          // proto3 omits false; so do we

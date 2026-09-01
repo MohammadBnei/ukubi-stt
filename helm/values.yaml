@@ -115,6 +115,16 @@ env:
   # batch service rather than a failed upgrade. ADR-0046 Decision 2.
   - name: STT_STREAM_MODEL_DIR
     value: /models/nemotron
+  # Concurrent streaming sessions, cluster-wide. Default 8 if unset.
+  #
+  # The binding constraint is GPU duty cycle — each stream occupies the card for
+  # 20-50ms of every 560ms chunk — not the ~7.5MB of decoder state per session.
+  # 8 is roughly half the card with the batch path still needing room, but that
+  # is an estimate; raise it once real consumers are on it and the measurement
+  # says there is headroom. A 9th session gets RESOURCE_EXHAUSTED immediately,
+  # by design: queueing on one GPU converts overload into unbounded latency.
+  - name: STT_MAX_SESSIONS
+    value: "8"
 
 # STT_AUTH_TOKEN. The process refuses to start without it rather than serving a
 # GPU on a hostname that Certificate Transparency publishes minutes after

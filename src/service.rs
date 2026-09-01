@@ -34,11 +34,40 @@ pub struct ClientName(pub String);
 /// no Cloudflare WAF in front of it, so the body cap is ours to set.
 pub const MAX_DECODE_BYTES: usize = 16 * 1024 * 1024;
 
-/// A cap on concurrent streaming sessions. The binding constraint is not the
-/// ~7.5MB of decoder state each one holds — it is the GPU, which each stream
-/// occupies for 20-50ms out of every 560ms. Eight streams is roughly half the
-/// card's duty cycle, with the batch path still needing room.
-const MAX_SESSIONS: usize = 8;
+/// Default cap on concurrent streaming sessions, overridable with
+/// `STT_MAX_SESSIONS`.
+///
+/// The binding constraint is not the ~7.5MB of decoder state each one holds —
+/// it is the GPU, which each stream occupies for 20-50ms out of every 560ms.
+/// Eight is roughly half the card's duty cycle with the batch path still
+/// needing room, but that is an estimate, and the right number is whatever the
+/// card sustains once real consumers are on it. Configurable so tuning it is a
+/// values edit rather than a rebuild.
+const DEFAULT_MAX_SESSIONS: usize = 8;
+
+/// Split from the env read so the branching is testable without mutating
+/// process-global state, which two tests running in parallel would race on.
+fn parse_max_sessions(raw: Option<&str>) -> usize {
+    match raw {
+        None | Some("") => DEFAULT_MAX_SESSIONS,
+        Some(raw) => match raw.parse::<usize>() {
+            // Zero would silently disable streaming entirely — a very confusing
+            // way to discover a typo, so it falls back rather than being obeyed.
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(
+                    "STT_MAX_SESSIONS={raw:?} is not a positive integer; \
+                     using the default of {DEFAULT_MAX_SESSIONS}"
+                );
+                DEFAULT_MAX_SESSIONS
+            }
+        },
+    }
+}
+
+fn max_sessions() -> usize {
+    parse_max_sessions(std::env::var("STT_MAX_SESSIONS").ok().as_deref())
+}
 
 /// Sessions idle longer than this are swept. Browsers close tabs without
 /// sending `last: true`, and that is the normal case rather than the edge — an
@@ -86,18 +115,24 @@ pub struct SttService {
     /// load instead of racing to start several.
     stream_handle: Arc<tokio::sync::Mutex<Option<NemotronHandle>>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    max_sessions: usize,
 }
 
 impl SttService {
     pub fn new(model: ParakeetTDT, stream_dir: PathBuf) -> Self {
+        let max_sessions = max_sessions();
+        tracing::info!(max_sessions, "streaming session cap");
         Self {
             model: Arc::new(Mutex::new(model)),
             permits: Arc::new(tokio::sync::Semaphore::new(1)),
             stream_dir,
             stream_handle: Arc::new(tokio::sync::Mutex::new(None)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            max_sessions,
         }
     }
+
+
 
     /// Load the streaming model now, in the background, so the first streaming
     /// request does not pay for it.
@@ -180,10 +215,11 @@ impl SttService {
         if !create {
             return Ok(None);
         }
-        if map.len() >= MAX_SESSIONS {
+        if map.len() >= self.max_sessions {
             return Err(Status::resource_exhausted(format!(
-                "{MAX_SESSIONS} streaming sessions already active — there is one GPU. Retry, or \
-                 send `last: true` on sessions you have finished with."
+                "{} streaming sessions already active — there is one GPU. Retry, or send \
+                 `last: true` on sessions you have finished with.",
+                self.max_sessions
             )));
         }
 
@@ -509,4 +545,25 @@ pub async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
     tracing::info!("http (test page + health) listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ponytail: the parsing branch only. Everything else in this module needs a
+    // loaded model and a GPU.
+    #[test]
+    fn max_sessions_falls_back_rather_than_obeying_nonsense() {
+        assert_eq!(parse_max_sessions(None), DEFAULT_MAX_SESSIONS);
+        assert_eq!(parse_max_sessions(Some("")), DEFAULT_MAX_SESSIONS);
+        assert_eq!(parse_max_sessions(Some("12")), 12);
+
+        // A zero cap would disable streaming entirely and report it as
+        // RESOURCE_EXHAUSTED on the first chunk — indistinguishable from a busy
+        // GPU, which is exactly the wrong way to learn about a typo.
+        assert_eq!(parse_max_sessions(Some("0")), DEFAULT_MAX_SESSIONS);
+        assert_eq!(parse_max_sessions(Some("-3")), DEFAULT_MAX_SESSIONS);
+        assert_eq!(parse_max_sessions(Some("lots")), DEFAULT_MAX_SESSIONS);
+    }
 }

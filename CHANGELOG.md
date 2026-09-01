@@ -1,5 +1,18 @@
 # Changelog
 
+# [0.9.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.8.0...0.9.0) (2026-09-01)
+
+
+### Bug Fixes
+
+* **release:** bump Cargo.lock too, or the next image build fails ([#19](https://github.com/MohammadBnei/ukubi-stt/issues/19)) ([91ea2f5](https://github.com/MohammadBnei/ukubi-stt/commit/91ea2f57ac668d3559077652d67f39f7cc688680))
+
+
+### Features
+
+* **stt:** NeMo log-mel for the Persian model, verified against the real model ([#17](https://github.com/MohammadBnei/ukubi-stt/issues/17)) ([778e329](https://github.com/MohammadBnei/ukubi-stt/commit/778e3293e0aa477c4623335a649203637151dc41))
+* **stt:** the Persian ORT session, and --selftest-fa to gate it ([#18](https://github.com/MohammadBnei/ukubi-stt/issues/18)) ([2e10d2a](https://github.com/MohammadBnei/ukubi-stt/commit/2e10d2afdecf1298375cece26c732049d4311bd2))
+
 # [0.8.0](https://github.com/MohammadBnei/ukubi-stt/compare/0.7.0...0.8.0) (2026-09-01)
 
 

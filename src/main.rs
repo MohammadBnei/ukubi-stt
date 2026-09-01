@@ -13,6 +13,11 @@
 //! where a GPU is reachable.
 
 mod engine;
+// Nothing calls this yet — the ORT session that consumes it lands next, and CI runs
+// clippy with -D warnings. Delete this attribute in that change; if it is still here
+// once src/persian.rs exists, something did not get wired up.
+#[allow(dead_code)]
+mod fbank;
 mod service;
 
 use anyhow::{Context, Result};

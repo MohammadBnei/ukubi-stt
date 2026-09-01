@@ -16,10 +16,26 @@ parakeet-rs = { version = "0.3.7", features = ["cuda"] }
 # the newest published version; there is no stable release). A caret range on a
 # pre-1.0 rc is how a build silently moves to a different ONNX Runtime ABI —
 # and per ADR-0045 that ABI decides the base image, so it is not ours to float.
+# `cuda` is named here rather than inherited: it resolves today only because
+# parakeet-rs's own `cuda = ["ort/cuda"]` unifies across the graph, so
+# `ort::ep::CUDA` compiles without this crate ever asking for it — and would
+# vanish the day that crate reorganised its features. Declaring what we use turns
+# a spooky future breakage into an ordinary one.
 ort = "=2.0.0-rc.13"
 
 anyhow = "1.0"
 hound = "3.5"
+
+# Both already resolve through parakeet-rs, so naming them here compiles no
+# additional crates — but transitive availability is not importability, and a
+# transitive version is not a promise. realfft in particular is the same FFT
+# parakeet-rs uses for its own log-mel, so it is already exercised on this
+# hardware. Pinned to the majors parakeet-rs asks for: with no Cargo.lock
+# committed, a future realfft 4.0 would otherwise resolve ours to 4 while it
+# stayed on 3, compiling both and quietly changing the transform underneath
+# fbank.rs's golden vectors.
+realfft = "3"
+serde_json = "1"
 
 # ORT explains itself at debug level — which provider it registered, which it
 # declined, and why. ort routes those through `tracing`, parakeet-rs installs no

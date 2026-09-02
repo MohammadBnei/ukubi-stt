@@ -346,8 +346,9 @@ continues a word therefore arrives without one. Trimming each chunk and joining
 with a space turns `" bon"` + `"jour"` into `"bon jour"` — the word splits, and
 it looks like a model failure rather than a client bug. Concatenation is the
 whole protocol: `transcript += r.text`, with no guard, because a chunk that is
-nothing but a separator has to survive too. The reference page got this wrong
-until 0.10.3; if it and this paragraph ever disagree again, this paragraph wins.
+nothing but a separator has to survive too. The reference page got this wrong for
+as long as streaming existed, and it is the artefact people copy — if it and this
+paragraph ever disagree again, this paragraph wins.
 
 **Append with a functional state update.** In React,
 `onChange(value + text)` captures `value` from the render that started the

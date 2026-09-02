@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.2](https://github.com/MohammadBnei/ukubi-stt/compare/0.10.1...0.10.2) (2026-09-02)
+
+
+### Bug Fixes
+
+* **web:** toPCM16 was imported and redeclared, so the page did nothing ([#23](https://github.com/MohammadBnei/ukubi-stt/issues/23)) ([ed2c9f1](https://github.com/MohammadBnei/ukubi-stt/commit/ed2c9f132459b7afcbce0cdd982737ab5ad9b706)), closes [#15](https://github.com/MohammadBnei/ukubi-stt/issues/15)
+
 ## [0.10.1](https://github.com/MohammadBnei/ukubi-stt/compare/0.10.0...0.10.1) (2026-09-01)
 
 

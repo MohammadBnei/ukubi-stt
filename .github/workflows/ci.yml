@@ -62,6 +62,14 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # web/index.html is include_str!'d into the binary, so a syntax error in it
+      # compiles, ships, and shows up only in a browser console. One did: toPCM16
+      # was both imported and redeclared, which kills the module at parse time and
+      # made the whole page inert. It survived four releases because the only
+      # check anyone ran was that `/` returned 200 — which it did throughout.
+      - name: Check the browser page parses
+        run: node scripts/check-web-syntax.mjs
+
   audit:
     runs-on: ubuntu-latest
     steps:

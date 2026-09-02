@@ -306,17 +306,10 @@ function onUnauthenticated() {
 
 /* -------------------------------------------------------------------- audio */
 
-function toPCM16(f32) {
-  const out = new Uint8Array(f32.length * 2);
-  const view = new DataView(out.buffer);
-  for (let i = 0; i < f32.length; i++) {
-    // Clamp before scaling: a sample above 1.0 wraps to a large negative
-    // int16, which is heard as a click and read by the model as noise.
-    const s = Math.max(-1, Math.min(1, f32[i]));
-    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
-  return out;
-}
+// toPCM16 is imported from /stt-capture.js at the top of this module. It used to
+// be duplicated here as well, which is a SyntaxError — and because the duplicate
+// declaration kills the whole module at parse time, the symptom was the entire
+// page doing nothing rather than the audio path misbehaving.
 
 // Ordering and queueing live in /stt-capture.js for the microphone path. The
 // file path below is a single offline request, so it needs neither.

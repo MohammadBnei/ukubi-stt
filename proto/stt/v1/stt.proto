@@ -70,6 +70,11 @@ message RecognizeRequest {
 }
 
 message RecognizeResponse {
+  // A FRAGMENT, not a sentence. Concatenate it verbatim and never trim it: the
+  // leading space is the word boundary, so a chunk that continues a word across
+  // a chunk boundary arrives without one. Trimming each chunk and re-joining
+  // with a space splits words ("bon jour"). In offline mode there is one
+  // response and the point is moot.
   string text = 1;
 
   // These two exist so any client can compute the real-time factor itself.

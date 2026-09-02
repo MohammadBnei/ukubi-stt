@@ -113,14 +113,53 @@ enum Loaded {
 /// the whole process, against an allocation and a pointer chase on every decode.
 #[allow(clippy::large_enum_variant)]
 enum Recognizer {
-    Nemotron { rec: Nemotron, chunk: usize },
+    Nemotron {
+        rec: Nemotron,
+        chunk: usize,
+        /// Whether anything has been emitted yet, so the utterance's leading word
+        /// separator can be dropped exactly once. `PersianStream` carries the same
+        /// flag for the same reason.
+        emitted: bool,
+    },
     Persian(PersianStream),
+}
+
+/// Drop the utterance's leading word separator, exactly once.
+///
+/// SentencePiece marks a word-INITIAL piece with `\u{2581}`, which parakeet-rs renders
+/// as a leading space (`nemotron.rs:276-282`). That space is the only word-boundary
+/// signal on the wire, so a chunk continuing a word correctly arrives without one.
+///
+/// The crate's whole-utterance decoder trims exactly one leading separator
+/// (`nemotron.rs:264-274`), but the per-chunk streaming path has nowhere that
+/// happens, so a verbatim-concatenating transcript opened with a stray space.
+///
+/// This does NOT stop a client from splitting words — that bug lives entirely in
+/// the client, and dropping the FIRST chunk's separator cannot help chunks 2..N,
+/// which is where a mid-word boundary lands. `PersianStream` already had this
+/// flag and the browser split Persian words anyway. What it removes is the BAIT:
+/// the stray leading space is very plausibly why someone reached for `.trim()`
+/// in the first place. Deleting the space is what stops the trim coming back.
+fn drop_leading_separator(text: &str, emitted: &mut bool) -> String {
+    if *emitted {
+        return text.to_string();
+    }
+    let trimmed = text.trim_start();
+    // Only a chunk that actually carried text counts: the first chunks of a
+    // dictation are routinely empty, and consuming the flag on one of those would
+    // leave the real first word with its separator still attached.
+    *emitted = !trimmed.is_empty();
+    trimmed.to_string()
 }
 
 impl Recognizer {
     fn transcribe(&mut self, mut samples: Vec<f32>, last: bool) -> anyhow::Result<String> {
         match self {
-            Recognizer::Nemotron { rec, chunk } => {
+            Recognizer::Nemotron {
+                rec,
+                chunk,
+                emitted,
+            } => {
                 // FLUSH THE TAIL. The encoder emits only on a COMPLETE chunk, so a
                 // final partial one is buffered and never decoded — measured live
                 // on 2026-08-31, where a 9.23s utterance ended "...on an NVIDIA G"
@@ -138,8 +177,10 @@ impl Recognizer {
                     }
                     samples.resize(samples.len() + *chunk, 0.0);
                 }
-                rec.transcribe_chunk(&samples)
-                    .map_err(|e| anyhow::anyhow!("{e}"))
+                let text = rec
+                    .transcribe_chunk(&samples)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(drop_leading_separator(&text, emitted))
             }
             // Persian pads inside its own feature extractor, at frame granularity
             // and with a true-length input, so `last` needs no sample arithmetic
@@ -403,6 +444,7 @@ impl SttService {
                 Recognizer::Nemotron {
                     rec,
                     chunk: handle.chunk_samples(),
+                    emitted: false,
                 }
             }
             // The Persian model is monolingual and has no language knob, so
@@ -786,6 +828,38 @@ mod tests {
                 "{other} should stay on Nemotron"
             );
         }
+    }
+
+    // ponytail: the join arithmetic only, which is where the bug was. Anything
+    // model-shaped needs a loaded model and a GPU.
+    #[test]
+    fn chunks_concatenate_without_inventing_a_word_boundary() {
+        // What the wire actually carries. SentencePiece marks a word-INITIAL
+        // piece, so a chunk that CONTINUES a word has no leading space, and
+        // "bonjour" straddling a chunk boundary arrives as " bon" then "jour".
+        // The bug: a client that trimmed each chunk and re-inserted a space
+        // rendered that as "bon jour".
+        let mut emitted = false;
+        let joined: String = ["", " bon", "jour", " suis", " la"]
+            .iter()
+            .map(|c| drop_leading_separator(c, &mut emitted))
+            .collect();
+        assert_eq!(joined, "bonjour suis la");
+
+        // A whitespace-only chunk must NOT consume the flag. The first chunks of
+        // a dictation are routinely empty, and spending it on one of those would
+        // leave the real first word with its separator attached.
+        let mut emitted = false;
+        assert_eq!(drop_leading_separator(" ", &mut emitted), "");
+        assert!(!emitted);
+        assert_eq!(drop_leading_separator("", &mut emitted), "");
+        assert!(!emitted);
+        assert_eq!(drop_leading_separator(" bon", &mut emitted), "bon");
+        assert!(emitted);
+
+        // Once emitted, the text is passed through untouched — including a chunk
+        // that is nothing but the separator between two words.
+        assert_eq!(drop_leading_separator(" ", &mut emitted), " ");
     }
 
     #[test]

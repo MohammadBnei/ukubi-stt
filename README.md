@@ -339,6 +339,17 @@ costing a sentence. Pre-opening the microphone would close it entirely and is
 deliberately not done — it leaves the recording indicator lit on a page the user
 has not asked to record on.
 
+**Append each chunk verbatim. Never trim one, never add your own separator.**
+The leading space *is* the word boundary. SentencePiece marks a word-INITIAL
+piece, the detokeniser renders that mark as a leading space, and a chunk that
+continues a word therefore arrives without one. Trimming each chunk and joining
+with a space turns `" bon"` + `"jour"` into `"bon jour"` — the word splits, and
+it looks like a model failure rather than a client bug. Concatenation is the
+whole protocol: `transcript += r.text`, with no guard, because a chunk that is
+nothing but a separator has to survive too. The reference page got this wrong for
+as long as streaming existed, and it is the artefact people copy — if it and this
+paragraph ever disagree again, this paragraph wins.
+
 **Append with a functional state update.** In React,
 `onChange(value + text)` captures `value` from the render that started the
 recording, so every chunk appends to the same stale string and visibly

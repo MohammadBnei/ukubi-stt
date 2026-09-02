@@ -319,9 +319,16 @@ async function doSend(pcm, sessionId, last) {
     const r = await recognize(pcm, getToken(), sessionId, last);
     const rtt = (performance.now() - started) / 1000;
 
-    if (r.text.trim()) {
-      $("transcript").textContent += (($("transcript").textContent && " ") || "") + r.text.trim();
-    }
+    // Append VERBATIM. The leading space IS the word boundary: SentencePiece marks
+    // a word-INITIAL piece, so a chunk that continues a word arrives without one.
+    // This used to trim each chunk and re-insert a space, which turned " bon" +
+    // "jour" into "bon jour" -- the split-word bug, and the third time this repo
+    // lost text at a chunk boundary after the tail flush and the Persian
+    // detokenise. There is deliberately no `if (r.text)` guard: appending "" is
+    // already a no-op, and a chunk whose entire text is one separator has to
+    // survive or it glues the two words either side of it together.
+    // ponytail: verbatim is the whole point. Do not "tidy" a trim back in here.
+    $("transcript").textContent += r.text;
     state.audio += r.audio_seconds;
     state.decode += r.decode_seconds;
     state.chunks += 1;
@@ -342,7 +349,7 @@ async function doSend(pcm, sessionId, last) {
         'x faster than realtime.</span>';
     }
     log("chunk " + state.chunks + ": " + r.audio_seconds.toFixed(2) + "s audio, " +
-        r.decode_seconds.toFixed(3) + "s decode, " + rtt.toFixed(2) + "s round trip" +
+        r.decode_seconds.toFixed(3) + "s decode, " + rtt.toFixed(2) + "s round trip",
         "ok");
   } catch (e) {
     if (e.grpcCode === 16) onUnauthenticated();

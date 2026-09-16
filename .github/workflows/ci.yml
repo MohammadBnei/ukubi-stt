@@ -13,10 +13,11 @@
 # of which a `cargo clippy` on a hosted runner can reach.
 name: ci
 
+# Called by image.yml rather than triggered directly, so the checks and the release they
+# gate happen in one run. Triggering here as well would run them twice on every push and
+# leave the release depending on a different run than the one you are looking at.
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always

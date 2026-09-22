@@ -14,24 +14,121 @@
 # for the gap rather than merely un-upgraded.
 name: image
 
+# One run: push to main -> checks -> release (version + changelog) -> image build and push
+# -> helm tag bump. Previously the release was cut by hand locally and this workflow waited
+# for the tag it produced, which meant the tag had to trigger a workflow — so it could never
+# be pushed by the built-in token. Sequential jobs need no trigger.
 on:
   workflow_dispatch:
+  pull_request:
   push:
-    tags:
+    branches:
+      - main
+    paths-ignore:
+      # The release commit touches these, and so does deploy's bump. Pushes made with the
+      # built-in GITHUB_TOKEN do not trigger workflows either, so the loop is closed twice.
+      - '**.md'
+      - 'helm/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'package.json'
+    tags-ignore:
       - '*'
+
+# Two pushes must not compute the same version from the same latest tag and lose one.
+concurrency:
+  group: release
+  cancel-in-progress: true
 
 env:
   REGISTRY: registry.bnei.lan:5000
   # Not a secret, and an empty secret cost agent-fleet a release once.
   REGISTRY_USER: ci
   IMAGE: ukubi-stt
+  # The registry password comes from the shared platform-commons project over OIDC rather
+  # than a repo secret (infra-bootstrap ADR-0049): one place to rotate it for every build
+  # repo. Bound to a repository allowlist plus event_name push/workflow_dispatch — a `ref`
+  # binding cannot work, since Infisical matches claims exactly and tag refs cannot be
+  # enumerated.
+  INFISICAL_DOMAIN: https://infisical.bnei.dev
+  INFISICAL_PROJECT_SLUG: platform-commons-76pb
+  INFISICAL_ENV: dev
+  INFISICAL_IDENTITY_ID: 19807471-d73a-48d4-9e58-1dc34255ef77
 
 jobs:
-  build-push:
-    runs-on: [self-hosted, ukubi-build]
+  # The Rust checks, defined once in ci.yml and called here so they gate the release in the
+  # same run. They used to live on their own trigger, which meant a red clippy could not stop
+  # a version being cut.
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  # Cuts the version and CHANGELOG. This was a local `bun run release` until now, which is
+  # why nothing in CI ever versioned this repo. release-it only pushes a commit and a tag —
+  # github.release is false — which contents: write covers, so no PAT is involved.
+  #
+  # Needs cargo on the runner: release-it's after:bump hook seds Cargo.toml and runs
+  # `cargo update`, so package.json and Cargo.toml stay on the same version. ubuntu-latest
+  # ships a toolchain. requireCommits is true with requireCommitsFail false in the config, so
+  # a push with nothing releasable exits clean rather than red.
+  release:
+    needs: checks
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: git config
+        run: |
+          git config user.name "ukubi-stt-ci"
+          git config user.email "noreply@bnei.dev"
+
+      - name: Run release-it
+        run: git update-index --refresh && git diff-index --quiet HEAD || git reset --hard && bun run release
+
+      - name: Read the released version
+        id: version
+        run: |
+          set -euo pipefail
+          # Cargo.toml is the source of truth the image tag is read from, so read it here too
+          # rather than package.json — if the after:bump hook ever failed, this catches it.
+          v=$(grep -m1 '^version *= *"' Cargo.toml | cut -d'"' -f2)
+          [ -n "$v" ] || { echo "::error::no version in Cargo.toml"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  build-push:
+    needs: [checks, release]
+    # always() plus an explicit check: `release` is push-only, so a dispatch skips it and the
+    # implicit success()-on-needs would skip the build too. 'skipped' passes, 'failure' does
+    # not. PRs build nothing — this job is the only one that needs the LAN, and a PR has
+    # nothing to push.
+    if: >-
+      always()
+      && github.event_name != 'pull_request'
+      && needs.checks.result == 'success'
+      && needs.release.result != 'failure'
+    runs-on: [self-hosted, ukubi-build]
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The tag release-it just made on a release run; the dispatched ref otherwise.
+          # Checking out main on a release run would race the next push.
+          ref: ${{ needs.release.outputs.version || github.ref }}
           fetch-depth: 0
 
       - name: Compute the image tag
@@ -41,15 +138,36 @@ jobs:
           # Cargo.toml is TOML, so no jq. First `version = "..."` in [package].
           version=$(grep -m1 '^version *= *"' Cargo.toml | cut -d'"' -f2)
           [ -n "$version" ] || { echo "::error::no version in Cargo.toml"; exit 1; }
-          if [ "${{ github.event_name }}" = "push" ] && [ "$version" != "${{ github.ref_name }}" ]; then
-            echo "::error::Cargo.toml version ($version) does not match the tag (${{ github.ref_name }})"
-            exit 1
-          fi
+          # The assert that compared this against github.ref_name is gone. It guarded a
+          # disagreement between the version built and the tag deploy pinned, and that cannot
+          # happen now: deploy pins this job's own output, so it pins exactly what was pushed.
+          # It would also fail every run, since on a branch push ref_name is "main".
           echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      # Only REGISTRY_PASSWORD, not the whole environment.
+      - name: Read the registry password from Infisical
+        uses: Infisical/secrets-action@v1.0.12
+        with:
+          method: oidc
+          identity-id: ${{ env.INFISICAL_IDENTITY_ID }}
+          oidc-audience: infisical.bnei.dev
+          domain: ${{ env.INFISICAL_DOMAIN }}
+          project-slug: ${{ env.INFISICAL_PROJECT_SLUG }}
+          env-slug: ${{ env.INFISICAL_ENV }}
+          secret-path: /
+          secret-name: REGISTRY_PASSWORD
+          export-type: env
+
+      # GitHub only auto-masks `secrets.*`, and this action's README does not document
+      # masking. An unmasked Infisical value leaked a token in cleartext in this estate once.
+      - name: Mask the fetched password
+        run: echo "::add-mask::$REGISTRY_PASSWORD"
 
       - name: Registry login
         run: |
-          echo "${{ secrets.REGISTRY_PASSWORD }}" | sudo buildah login \
+          set -euo pipefail
+          [ -n "${REGISTRY_PASSWORD:-}" ] || { echo "Infisical returned no REGISTRY_PASSWORD"; exit 1; }
+          printf '%s' "$REGISTRY_PASSWORD" | sudo buildah login \
             --tls-verify=false \
             --username "$REGISTRY_USER" \
             --password-stdin "$REGISTRY"
@@ -76,7 +194,7 @@ jobs:
   # Only now does ArgoCD get told about the new tag. Shape copied from
   # agent-fleet's docker.yml, including its two hard-won details.
   deploy:
-    needs: build-push
+    needs: [release, build-push]
     # always() + an explicit result check, not a bare `if: github.event_name ==
     # 'push'`. agent-fleet recorded this from a live v1.1.0 run: the build
     # genuinely succeeded and deploy was still skipped with zero steps, because
@@ -85,10 +203,17 @@ jobs:
     # comparison below is what actually guards against deploying a failed build.
     if: >-
       always() && github.event_name == 'push' &&
+      needs.release.result == 'success' &&
       needs.build-push.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # The tag build-push actually pushed, not the ref name. This used to be the ref name,
+    # which only worked because the workflow was tag-triggered; on a branch push that is
+    # "main", and this job would have pinned `tag: "main"`. Taking it from the build job
+    # means the manifest pins exactly the artifact that exists.
+    env:
+      TAG: ${{ needs.build-push.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -98,13 +223,13 @@ jobs:
       - name: Bump the pinned image tag
         run: |
           set -euo pipefail
-          sed -i -E "s/^(  tag: \")[^\"]+(\")/\1${GITHUB_REF_NAME}\2/" helm/values.yaml
+          sed -i -E "s/^(  tag: \")[^\"]+(\")/\1${TAG}\2/" helm/values.yaml
 
           # A no-op sed is the real failure mode here: if the pattern stops
           # matching, values.yaml keeps naming the previous release, ArgoCD
           # redeploys nothing, and the workflow is green. Silence would read as
           # success, so assert the tag actually landed.
-          grep -q "^  tag: \"${GITHUB_REF_NAME}\"$" helm/values.yaml || {
+          grep -q "^  tag: \"${TAG}\"$" helm/values.yaml || {
             echo "::error::image.tag was not bumped in helm/values.yaml — check the sed against the file's actual indentation"
             exit 1
           }
@@ -119,8 +244,8 @@ jobs:
           git config user.email "noreply@bnei.dev"
           git add helm/values.yaml
           if git diff --cached --quiet; then
-            echo "image tag already at ${GITHUB_REF_NAME}, nothing to commit"
+            echo "image tag already at ${TAG}, nothing to commit"
             exit 0
           fi
-          git commit -m "chore(deploy): bump image tag to ${GITHUB_REF_NAME}"
+          git commit -m "chore(deploy): bump image tag to ${TAG}"
           git push origin HEAD:main

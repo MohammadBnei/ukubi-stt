@@ -641,8 +641,8 @@ impl pb::stt_server::Stt for SttService {
 /// same credential, so the id is the only thing separating them.
 ///
 /// Credentials come from the environment (see `config.rs`) as
-/// `STT_TOKEN_<NAME>`, one per caller, plus the original `STT_AUTH_TOKEN` as `default` so nothing that
-/// works today stops working. Adding a caller is a new Infisical secret;
+/// `STT_TOKEN_<NAME>`, one per caller, plus the original `STT_AUTH_TOKEN` as
+/// `default` so nothing that works today stops working. Adding a caller is a new Infisical secret;
 /// revoking one is deleting it. Both are one action affecting one caller.
 ///
 /// forwardAuth remains rejected on the ground ADR-0044 gave: authentik's proxy

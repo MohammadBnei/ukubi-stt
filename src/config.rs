@@ -556,41 +556,114 @@ mod tests {
         assert_eq!(flags, read_flags, "README flags vs parser flags");
     }
 
+    /// Every `.rs` file under `src/`, recursively, plus build.rs. The count is
+    /// pinned so a file the walk misses, or a new module, fails here first.
+    fn rust_sources() -> Vec<PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("build.rs")];
+        walk(&root.join("src"), &mut files);
+        files.sort();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().display().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "build.rs",
+                "src/config.rs",
+                "src/engine.rs",
+                "src/fbank.rs",
+                "src/main.rs",
+                "src/persian.rs",
+                "src/service.rs",
+            ],
+            "a new source file: add it here and re-check the counts below"
+        );
+        files
+    }
+
+    /// Counts `needle` per source file, keeping only the files that have it.
+    fn count_in_sources(needle: &str) -> std::collections::BTreeMap<String, usize> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        rust_sources()
+            .iter()
+            .filter_map(|p| {
+                let n = std::fs::read_to_string(p).unwrap().matches(needle).count();
+                let name = p.strip_prefix(root).unwrap().display().to_string();
+                (n > 0).then_some((name, n))
+            })
+            .collect()
+    }
+
+    fn counts(pairs: &[(&str, usize)]) -> std::collections::BTreeMap<String, usize> {
+        pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect()
+    }
+
     /// clippy.toml's ban is only as good as its exemptions. Any
     /// `allow`/`expect` of the lint, or of a group containing it, outside these
     /// sites is a second config reader.
     #[test]
     fn lint_escapes_are_only_at_the_approved_sites() {
-        let lint = concat!("disallowed", "_methods");
-        let root = env!("CARGO_MANIFEST_DIR");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(format!("{root}/src"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
-        files.push(format!("{root}/build.rs").into());
-        let mut found = std::collections::BTreeMap::new();
-        for path in &files {
-            let text = std::fs::read_to_string(path).unwrap();
-            for group in [concat!("clippy", "::all"), concat!("clippy", "::style")] {
+        for path in rust_sources() {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for group in [
+                concat!("clippy", "::all"),
+                concat!("clippy", "::style"),
+                concat!("(warn", "ings"),
+                concat!(", warn", "ings"),
+            ] {
                 assert!(!text.contains(group), "{} silences {group}", path.display());
             }
-            let n = text.matches(lint).count();
-            if n > 0 {
-                found.insert(path.file_name().unwrap().to_string_lossy().into_owned(), n);
-            }
         }
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            !manifest.contains(concat!("[lin", "ts")),
+            "Cargo.toml lint table"
+        );
         // config.rs: from_process. engine.rs: gpu_used_mib (exec) and one test.
         // main.rs: its test module. build.rs: OUT_DIR at build time.
-        let want: std::collections::BTreeMap<String, usize> = [
-            ("build.rs", 1),
-            ("config.rs", 1),
-            ("engine.rs", 2),
-            ("main.rs", 1),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
-        .collect();
-        assert_eq!(found, want);
+        assert_eq!(
+            count_in_sources(concat!("disallowed", "_methods")),
+            counts(&[
+                ("build.rs", 1),
+                ("src/config.rs", 1),
+                ("src/engine.rs", 2),
+                ("src/main.rs", 1),
+            ])
+        );
+    }
+
+    /// The goal itself, without clippy: no file outside the exempt sites names
+    /// `std::env` or spawns a process. A token count, so it also catches a
+    /// reader clippy would only see under `-D warnings` in CI. config.rs's
+    /// count includes two comments.
+    #[test]
+    fn only_the_exempt_sites_touch_the_environment() {
+        assert_eq!(
+            count_in_sources(concat!("env", "::")),
+            counts(&[
+                ("build.rs", 1),
+                ("src/config.rs", 4),
+                ("src/engine.rs", 1),
+                ("src/main.rs", 2),
+            ]),
+            "a new std::env use: read it through Config instead"
+        );
+        assert_eq!(
+            count_in_sources(concat!("Command", "::new")),
+            counts(&[("src/engine.rs", 1), ("src/main.rs", 2)]),
+            "a new child process inherits every credential"
+        );
     }
 }

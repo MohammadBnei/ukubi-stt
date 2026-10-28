@@ -397,9 +397,13 @@ Releasing above). Merging to `main` builds nothing.
 ### Configuration
 
 Read once at start by `src/config.rs`, which reports every problem in one
-error and refuses to start on any of them. Nothing else in the binary reads the
-environment (`clippy.toml` bans it), and a test holds these two tables to what
-the loader actually reads.
+error and refuses to start on any of them. `clippy.toml` bans every `std::env`
+reader, the `tracing-subscriber` env constructors and `std::process::Command::new`
+everywhere else; CI's `cargo clippy -D warnings` enforces it, and config.rs's
+tests pin the few exempt sites (the `nvidia-smi` probe in `engine.rs`, which
+inherits the environment; `OUT_DIR` in `build.rs`; test-only code). The ban does
+not see `libc::getenv`, `/proc/self/environ` or compile-time `env!`. A test also
+holds these two tables to what the loader actually reads.
 
 | Argument | Mode |
 |---|---|

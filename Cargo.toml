@@ -68,5 +68,27 @@ axum = "0.8"
 # answer on a security path.
 subtle = "2.6"
 
+# Traces, opt-in: nothing below runs unless OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+# is set (src/traces.rs). default-features off everywhere: the defaults carry
+# internal-logs (the SDK logging its own failures, some at ERROR, which
+# log-error-rate-spike counts) and reqwest's default TLS (rustls on aws-lc-rs).
+# This build has no TLS client, so an https endpoint is refused at start.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+# HeaderExtractor for the caller's traceparent; already in the graph via otlp.
+opentelemetry-http = { version = "0.33", default-features = false }
+tower-http = { version = "0.7", default-features = false, features = ["trace"] }
+# Our own client rather than the SDK's, for .no_proxy(): reqwest reads
+# HTTP_PROXY and friends even without its system-proxy feature.
+reqwest = { version = "0.13", default-features = false, features = ["blocking"] }
+# Already in the graph through tonic and axum.
+http = "1"
+
+[dev-dependencies]
+# Decodes what the in-process collector in main.rs's tests receives.
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace"] }
+
 [build-dependencies]
 tonic-prost-build = "0.14"

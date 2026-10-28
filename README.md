@@ -403,7 +403,8 @@ Releasing above). Merging to `main` builds nothing.
 ### Configuration
 
 Read once at start by `src/config.rs`, which reports every problem in one
-error and refuses to start on any of them. `clippy.toml` bans every `std::env`
+error and refuses to start on any of them. The one exception is the optional
+traces endpoint: a bad value there is one WARN line and no tracing. `clippy.toml` bans every `std::env`
 reader, the `tracing-subscriber` env constructors and `std::process::Command::new`
 everywhere else; CI's `cargo clippy -D warnings` enforces it, and config.rs's
 tests pin the few exempt sites (the `nvidia-smi` probe in `engine.rs`, which
@@ -433,20 +434,42 @@ argument refuses to start.
 | `STT_AUTH_TOKEN` | — | the original credential, reported as client `default` |
 | `STT_TOKEN_<NAME>` | — | one credential per caller, reported as client `<name>` lowercased. Serve needs at least one of these or `STT_AUTH_TOKEN`; empty values do not count |
 | `RUST_LOG` | `info,ort=debug` | tracing filter. Invalid falls back to the default; empty means no directives |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | — | full OTLP/HTTP traces URL (`http://…/v1/traces`). Unset or empty: no tracing. Anything else (no path, https, a `user:pass@`, not UTF-8) is one WARN and no tracing, never a refusal |
 
 A value under any `STT_*` name or `RUST_LOG` that is not valid UTF-8 refuses to
-start. Error messages name a token's variable, never its value.
+start. Error messages name a token's variable, never its value; a traces
+endpoint with an `@`, `?` or `#` in it is never echoed either.
 
 Logs are JSON, one object per line: `timestamp`, `level`, `message` and the
 event's fields, then `target` and the current span (tracing-subscriber's
 keys). Serve writes them to stdout; the `--selftest*` modes write them to
 stderr, because their stdout is the report.
 
+Traces are opt-in and off by default (the chart sets no endpoint). With
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` set, each gRPC call (`stt.v1.Stt/Recognize`
+and both reflection versions) is one server span, named by its method, with
+`rpc.system`, `rpc.service`, `rpc.method` and `rpc.grpc.status_code`; a
+server-fault code (INTERNAL, UNAVAILABLE, UNKNOWN, ...) sets its status to
+ERROR. An unknown method, the page and `/healthz` and `/livez` are not traced.
+A caller's `traceparent` is a link, never the parent: every call is a new
+trace. Spans are exported in batches over OTLP/HTTP protobuf, and the last
+batch on SIGTERM, after in-flight calls finish. A failed export is a WARN line.
+Log lines are the same with traces on or off. This build has no TLS client, so
+an https collector is refused (WARN, no tracing); `OTEL_EXPORTER_OTLP_ENDPOINT`
+on its own turns nothing on.
+
 Libraries read their own variables, which are not in the table: ONNX Runtime
 and the `ort` crate (`ORT_LOG`, among others), the CUDA runtime
-(`CUDA_VISIBLE_DEVICES` and the `NVIDIA_*` set the device plugin injects), and
-tracing-subscriber's `NO_COLOR`. `fetch-model.sh`, the initContainer, is a
-separate program and reads `TDT_REPO`, `NEMOTRON_REPO` and `SHENAVA_REPO`.
+(`CUDA_VISIBLE_DEVICES` and the `NVIDIA_*` set the device plugin injects),
+tracing-subscriber's `NO_COLOR`, and, only when traces are on, the OpenTelemetry
+SDK: `OTEL_BSP_*` (batching), `OTEL_EXPORTER_OTLP_HEADERS` and
+`OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `…_COMPRESSION` (gzip and zstd are not in
+this build: the SDK ignores them and sends uncompressed), `…_TIMEOUT` (the retry
+deadline only; one request is bounded at 10s), `…_PROTOCOL` (overridden:
+always protobuf), `OTEL_SPAN_*_COUNT_LIMIT`, and `OTEL_TRACES_SAMPLER`
+(overridden: every call is sampled). `OTEL_SERVICE_NAME` and
+`OTEL_RESOURCE_ATTRIBUTES` are not read: the service is always `ukubi-stt`.
+`fetch-model.sh`, the initContainer, is a separate program and reads `TDT_REPO`, `NEMOTRON_REPO` and `SHENAVA_REPO`.
 
 ### Transports
 

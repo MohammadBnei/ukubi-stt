@@ -38,6 +38,12 @@ pub struct Config {
     /// `RUST_LOG` verbatim. Unset is `None`; empty is `Some("")`, which
     /// tracing-subscriber parses as "no directives" rather than falling back.
     pub log_filter: Option<String>,
+    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, checked. Unset, empty or invalid
+    /// is `None`: no tracing.
+    pub traces_endpoint: Option<String>,
+    /// Optional settings that were set but invalid and fell back to their
+    /// default. The loader runs before the logger, so main logs each at WARN.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -113,17 +119,25 @@ struct Env {
 }
 
 impl Env {
-    /// Keys this service owns. A non-UTF-8 value under one is refused; anything
-    /// else is somebody else's (a library's, the shell's) and is ignored.
+    /// Keys this service owns. A non-UTF-8 value under one is refused (the
+    /// traces endpoint, which is optional, only warns); anything else is
+    /// somebody else's (a library's, the shell's) and is ignored.
     fn owned(key: &str) -> bool {
-        key.starts_with("STT_") || key == "RUST_LOG"
+        key.starts_with("STT_") || key == "RUST_LOG" || key == TRACES_ENDPOINT
     }
 
-    fn new(raw: impl IntoIterator<Item = (OsString, OsString)>, errors: &mut Vec<String>) -> Self {
+    fn new(
+        raw: impl IntoIterator<Item = (OsString, OsString)>,
+        errors: &mut Vec<String>,
+        warnings: &mut Vec<String>,
+    ) -> Self {
         let mut vars = Vec::new();
         for (k, v) in raw {
             match (k.into_string(), v.into_string()) {
                 (Ok(k), Ok(v)) if Self::owned(&k) => vars.push((k, v)),
+                (Ok(k), Err(_)) if k == TRACES_ENDPOINT => {
+                    warnings.push(format!("{k} is not valid UTF-8; tracing is off"))
+                }
                 // Names the key, never the value: it may be a token.
                 (Ok(k), Err(_)) if Self::owned(&k) => {
                     errors.push(format!("{k} is not valid UTF-8"))
@@ -161,6 +175,44 @@ impl Env {
     }
 }
 
+const TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+
+/// Unset or empty is no tracing. Otherwise the full OTLP/HTTP traces URL,
+/// because the exporter posts to the path as given ("" or "/" would be the
+/// collector's root, not /v1/traces). Anything else is one WARN and no
+/// tracing (owner, 2026-10-28: an optional setting that is set and invalid
+/// warns and takes its default). https warns too: this build carries no TLS
+/// client. A value with an `@` (a user:password, which belongs in
+/// OTEL_EXPORTER_OTLP_HEADERS) is refused. One with an `@`, `?` or `#` is
+/// never echoed.
+fn traces_endpoint(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw.filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    // A secret rides in userinfo or the query; neither is echoed.
+    let secret = raw.contains(['@', '?', '#']);
+    let shown = if secret {
+        "<redacted: contains @, ? or #>".to_string()
+    } else {
+        format!("{raw:?}")
+    };
+    let uri = raw.parse::<http::Uri>().ok();
+    match uri.as_ref().map(|u| (u.scheme_str(), u.host(), u.path())) {
+        Some((Some("https"), ..)) => Err(format!(
+            "{TRACES_ENDPOINT} {shown} is https, and this build has no TLS client; tracing is off"
+        )),
+        Some((Some("http"), Some(host), path))
+            if !raw.contains('@') && !host.is_empty() && !path.is_empty() && path != "/" =>
+        {
+            Ok(Some(raw.to_string()))
+        }
+        _ => Err(format!(
+            "{TRACES_ENDPOINT} {shown} is not an http URL with its traces path \
+             (…/v1/traces); tracing is off"
+        )),
+    }
+}
+
 /// Unset or empty is the default. Anything else that is not a positive integer
 /// refuses: zero would silently disable streaming, and a typo that quietly
 /// becomes 8 is a value nobody chose.
@@ -180,8 +232,8 @@ fn load_recorded(
     args: impl IntoIterator<Item = OsString>,
     env: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> (anyhow::Result<Config>, Reads) {
-    let mut errors = Vec::new();
-    let mut env = Env::new(env, &mut errors);
+    let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+    let mut env = Env::new(env, &mut errors, &mut warnings);
 
     // Trailing extra arguments are ignored, as they always have been. A
     // non-UTF-8 one is refused rather than panicking, as args() would.
@@ -248,6 +300,13 @@ fn load_recorded(
 
     let log_filter = env.get("RUST_LOG");
 
+    // OTEL_EXPORTER_OTLP_ENDPOINT is never read: on its own it turns nothing on.
+    let traces_endpoint =
+        traces_endpoint(env.get(TRACES_ENDPOINT).as_deref()).unwrap_or_else(|w| {
+            warnings.push(w);
+            None
+        });
+
     // One credential per caller as STT_TOKEN_<NAME>, plus the original
     // STT_AUTH_TOKEN as `default`. Empty values are not credentials.
     let mut clients: Vec<(String, Vec<u8>)> = env
@@ -305,6 +364,8 @@ fn load_recorded(
             fa_device,
             max_sessions,
             log_filter,
+            traces_endpoint,
+            warnings,
         }),
         _ => Err(anyhow::anyhow!(errors.join("\n"))),
     };
@@ -346,6 +407,8 @@ mod tests {
         assert_eq!(c.fa_device, Device::Cpu);
         assert_eq!(c.max_sessions, DEFAULT_MAX_SESSIONS);
         assert_eq!(c.log_filter, None);
+        assert_eq!(c.traces_endpoint, None);
+        assert!(c.warnings.is_empty());
         assert!(matches!(c.mode, Mode::Serve { .. }));
     }
 
@@ -361,6 +424,7 @@ mod tests {
                 ("STT_FA_DEVICE", "cuda"),
                 ("STT_MAX_SESSIONS", "12"),
                 ("RUST_LOG", "info,ort=info"),
+                (TRACES_ENDPOINT, "http://c:4318/v1/traces"),
             ],
         )
         .unwrap();
@@ -370,6 +434,10 @@ mod tests {
         assert_eq!(c.fa_device, Device::Cuda);
         assert_eq!(c.max_sessions, 12);
         assert_eq!(c.log_filter.as_deref(), Some("info,ort=info"));
+        assert_eq!(
+            c.traces_endpoint.as_deref(),
+            Some("http://c:4318/v1/traces")
+        );
     }
 
     /// Empty is not unset, for every variable, as before this loader existed.
@@ -558,12 +626,98 @@ mod tests {
         }
         // Not ours: ignored, where std::env::vars() used to panic on it.
         with("FOO").unwrap();
+        // Ours but optional: a WARN and no tracing, not a refusal.
+        let c = with(TRACES_ENDPOINT).unwrap();
+        assert_eq!(c.traces_endpoint, None);
+        assert_eq!(
+            c.warnings,
+            [format!(
+                "{TRACES_ENDPOINT} is not valid UTF-8; tracing is off"
+            )]
+        );
         let mut e = env(&[T]);
         e.push((OsString::from_vec(b"STT_TOKEN_\xff".to_vec()), "x".into()));
         assert!(Config::load(Vec::new(), e)
             .unwrap_err()
             .to_string()
             .contains("is not valid UTF-8"));
+    }
+
+    /// R13: unset or empty is off with no word; a bad value is off with one
+    /// warning, beside the other errors rather than instead of them.
+    #[test]
+    fn traces_endpoint_table() {
+        let on = |v: &str| {
+            let c = load(&[], &[T, (TRACES_ENDPOINT, v)]).unwrap();
+            assert!(c.warnings.is_empty(), "{v}: {:?}", c.warnings);
+            c.traces_endpoint
+        };
+        assert_eq!(on(""), None);
+        assert_eq!(
+            on("http://otel-collector.monitoring:4318/v1/traces").as_deref(),
+            Some("http://otel-collector.monitoring:4318/v1/traces")
+        );
+        assert_eq!(
+            on("http://10.0.0.1/x").as_deref(),
+            Some("http://10.0.0.1/x")
+        );
+        // The generic variable alone turns nothing on.
+        let c = load(&[], &[T, ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://c:4318")]).unwrap();
+        assert_eq!((c.traces_endpoint, c.warnings.len()), (None, 0));
+
+        let warns = |v: &str| {
+            let c = load(&[], &[T, (TRACES_ENDPOINT, v)]).unwrap();
+            assert_eq!(c.traces_endpoint, None, "{v}");
+            assert_eq!(c.warnings.len(), 1, "{v}");
+            c.warnings[0].clone()
+        };
+        let shape = |shown: &str| {
+            format!(
+                "{TRACES_ENDPOINT} {shown} is not an http URL with its traces path \
+                 (…/v1/traces); tracing is off"
+            )
+        };
+        for bad in [
+            "not a url",
+            "c:4318/v1/traces",
+            "ftp://c/v1/traces",
+            "http:///v1/traces",
+            "http://c:4318",
+            "http://c:4318/",
+            "/v1/traces",
+        ] {
+            assert_eq!(warns(bad), shape(&format!("{bad:?}")), "{bad}");
+        }
+        assert_eq!(
+            warns("https://c:4318/v1/traces"),
+            format!(
+                "{TRACES_ENDPOINT} \"https://c:4318/v1/traces\" is https, and this build \
+                 has no TLS client; tracing is off"
+            )
+        );
+        for secret in [
+            "http://user:pass@c/v1/traces",
+            "user:pass@c",
+            "https://u:p@c/v1/traces",
+            "https://c/v1/traces?api_key=pass",
+            "http://c?api_key=pass",
+            "u:p#c",
+        ] {
+            let w = warns(secret);
+            assert!(w.contains("<redacted: contains @, ? or #>"), "{w}");
+            assert!(!w.contains("pass") && !w.contains("u:p"), "{w}");
+        }
+        // A query on a valid endpoint is passed on, not refused.
+        assert_eq!(
+            on("http://c/v1/traces?k=v").as_deref(),
+            Some("http://c/v1/traces?k=v")
+        );
+        // Beside a real error: the error still refuses, the warning is not
+        // what refuses.
+        assert_eq!(
+            err(&[], &[T, (TRACES_ENDPOINT, "x"), ("STT_MAX_SESSIONS", "0")]),
+            [r#"STT_MAX_SESSIONS="0" is not a positive integer"#]
+        );
     }
 
     /// First cells of the table rows under `### Configuration`, split into
@@ -637,6 +791,7 @@ mod tests {
                 "src/main.rs",
                 "src/persian.rs",
                 "src/service.rs",
+                "src/traces.rs",
             ],
             "a new source file: add it here and re-check the counts below"
         );
@@ -718,7 +873,10 @@ mod tests {
     /// The goal itself, without clippy: no file outside the exempt sites names
     /// `std::env` or spawns a process. A token count, so it also catches a
     /// reader clippy would only see under `-D warnings` in CI. config.rs's
-    /// count includes two comments.
+    /// count includes two comments. main.rs's are all in its tests: the two
+    /// child gates (`var`), the traces child's Config (`vars_os`), the OTEL_*
+    /// scrub of its environment (`vars_os`) and the two `current_exe` spawns;
+    /// those two spawns and the two `sh -c kill` calls are its four processes.
     #[test]
     fn only_the_exempt_sites_touch_the_environment() {
         assert_eq!(
@@ -727,13 +885,13 @@ mod tests {
                 ("build.rs", 1),
                 ("src/config.rs", 4),
                 ("src/engine.rs", 1),
-                ("src/main.rs", 2),
+                ("src/main.rs", 6),
             ]),
             "a new std::env use: read it through Config instead"
         );
         assert_eq!(
             count_in_sources(concat!("Command", "::new")),
-            counts(&[("src/engine.rs", 1), ("src/main.rs", 2)]),
+            counts(&[("src/engine.rs", 1), ("src/main.rs", 4)]),
             "a new child process inherits every credential"
         );
     }

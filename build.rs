@@ -6,6 +6,10 @@
 // The descriptor set is what gRPC reflection serves: it lets a client discover
 // the service and its messages without being handed a .proto, which is the
 // difference between "vendor this file first" and `grpcurl <host> list`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "build-time OUT_DIR, not runtime config"
+)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     tonic_prost_build::configure()

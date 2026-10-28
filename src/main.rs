@@ -12,6 +12,7 @@
 //! construction so it cannot be moved to `.165`. There is no point in the build
 //! where a GPU is reachable.
 
+mod config;
 mod engine;
 mod fbank;
 mod persian;
@@ -25,45 +26,42 @@ const GRPC_ADDR: &str = "0.0.0.0:9090";
 const HEALTH_ADDR: &str = "0.0.0.0:8080";
 
 fn main() -> Result<()> {
+    let config = config::Config::from_process()?;
+
     // ORT names the provider it registered and the one it declined, with the
     // reason, at debug level. Without a subscriber those events are dropped and
     // a CUDA failure is indistinguishable from a CUDA success that used no
     // memory — which is exactly how 2026-08-31 was spent. Verbose by
-    // construction; RUST_LOG still overrides.
+    // construction; RUST_LOG still overrides, and an invalid one falls back.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ort=debug")),
+            config
+                .log_filter
+                .as_deref()
+                .and_then(|s| tracing_subscriber::EnvFilter::try_new(s).ok())
+                .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info,ort=debug")),
         )
         .with_writer(std::io::stderr)
         .init();
 
-    let model_dir: PathBuf = std::env::var("STT_MODEL_DIR")
-        .unwrap_or_else(|_| "/models/tdt".into())
-        .into();
-
-    let stream_dir: PathBuf = std::env::var("STT_STREAM_MODEL_DIR")
-        .unwrap_or_else(|_| "/models/nemotron".into())
-        .into();
-
-    let fa_dir: PathBuf = std::env::var("STT_FA_MODEL_DIR")
-        .unwrap_or_else(|_| "/models/shenava".into())
-        .into();
-
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("--selftest") => selftest(&model_dir, args.next().map(PathBuf::from)),
-        Some("--selftest-stream") => selftest_stream(&model_dir, &stream_dir),
-        Some("--selftest-fa") => {
-            let wav = args.next().map(PathBuf::from);
-            let reference = args.next();
-            selftest_fa(&fa_dir, wav, reference)
+    let config::Config {
+        mode,
+        model_dir,
+        stream_dir,
+        fa_dir,
+        fa_device,
+        max_sessions,
+        log_filter: _,
+    } = config;
+    match mode {
+        config::Mode::Selftest { wav } => selftest(&model_dir, wav),
+        config::Mode::SelftestStream => selftest_stream(&model_dir, &stream_dir),
+        config::Mode::SelftestFa { wav, reference } => {
+            selftest_fa(&fa_dir, fa_device, wav, reference)
         }
-        Some(other) => anyhow::bail!(
-            "unknown argument {other:?} — expected --selftest [wav], --selftest-stream, \
-             or --selftest-fa [wav] [reference text]"
-        ),
-        None => serve(&model_dir, stream_dir, fa_dir),
+        config::Mode::Serve { credentials } => {
+            serve(&model_dir, stream_dir, fa_dir, credentials, max_sessions)
+        }
     }
 }
 
@@ -107,14 +105,10 @@ fn selftest_stream(model_dir: &std::path::Path, stream_dir: &std::path::Path) ->
 /// variants, which move for reasons unrelated to whether the pipeline is correct.
 fn selftest_fa(
     fa_dir: &std::path::Path,
+    device: persian::Device,
     audio: Option<PathBuf>,
     reference: Option<String>,
 ) -> Result<()> {
-    let device = match std::env::var("STT_FA_DEVICE").as_deref() {
-        Ok("cuda") => persian::Device::Cuda,
-        Ok("cpu") | Err(_) => persian::Device::Cpu,
-        Ok(other) => anyhow::bail!("STT_FA_DEVICE={other:?} — expected \"cpu\" or \"cuda\""),
-    };
     println!("model dir      : {}", fa_dir.display());
     println!("device         : {device:?}");
 
@@ -245,7 +239,13 @@ fn selftest(model_dir: &std::path::Path, audio: Option<PathBuf>) -> Result<()> {
 /// Blocking `main` on purpose: the model loads and CUDA is asserted *before*
 /// any listener exists. There is no window in which this process is reachable
 /// but cannot decode.
-fn serve(model_dir: &std::path::Path, stream_dir: PathBuf, fa_dir: PathBuf) -> Result<()> {
+fn serve(
+    model_dir: &std::path::Path,
+    stream_dir: PathBuf,
+    fa_dir: PathBuf,
+    credentials: config::Credentials,
+    max_sessions: usize,
+) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -258,9 +258,10 @@ fn serve(model_dir: &std::path::Path, stream_dir: PathBuf, fa_dir: PathBuf) -> R
         shutdown_signal()?
     };
 
-    // Read before the expensive part. A credential problem is a config error and
-    // should not cost a 2.4GB model load and a CUDA context to discover.
-    let auth = service::BearerAuth::from_env()?;
+    // Credentials were validated in Config::load, before anything expensive: a
+    // credential problem should not cost a 2.4GB model load and a CUDA context
+    // to discover. Built here so the log line keeps its place.
+    let auth = service::BearerAuth::new(credentials);
 
     let model = engine::load_and_assert_cuda(model_dir)?;
 
@@ -277,7 +278,12 @@ fn serve(model_dir: &std::path::Path, stream_dir: PathBuf, fa_dir: PathBuf) -> R
         // Shared so a background task can warm the streaming model while the
         // server is already accepting traffic. from_arc rather than new()
         // exists for exactly this.
-        let svc = std::sync::Arc::new(service::SttService::new(model, stream_dir, fa_dir));
+        let svc = std::sync::Arc::new(service::SttService::new(
+            model,
+            stream_dir,
+            fa_dir,
+            max_sessions,
+        ));
         let warm = std::sync::Arc::clone(&svc);
         tokio::spawn(async move { warm.warm_streaming().await });
 
@@ -339,6 +345,10 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests spawn and configure child processes"
+)]
 mod tests {
     use std::process::{Child, Command};
     use std::time::{Duration, Instant};

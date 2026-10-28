@@ -128,7 +128,8 @@ env:
   # 44.8ms per 1.12s step measured on k8s-worker-01, i.e. 4% duty per stream.
   - name: STT_FA_MODEL_DIR
     value: /models/shenava
-  # Concurrent streaming sessions, cluster-wide. Default 8 if unset.
+  # Concurrent streaming sessions, cluster-wide. Default 8 if unset or empty;
+  # anything else that is not a positive integer refuses to start.
   #
   # The binding constraint is GPU duty cycle — each stream occupies the card for
   # 20-50ms of every 560ms chunk — not the ~7.5MB of decoder state per session.

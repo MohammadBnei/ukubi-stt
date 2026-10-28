@@ -26,12 +26,13 @@ on:
       - main
     paths-ignore:
       # Cargo.toml and Cargo.lock are NOT here: a dependency-only security bump has to run
-      # the checks. It ships only if releasable — commit it as `fix(deps):`; a `chore(deps):`
-      # bump cuts no release and build-push rebuilds the previous tag. That makes the GITHUB_TOKEN rule the ONLY loop-breaker — the
-      # release commit (CHANGELOG.md, package.json, Cargo.toml, Cargo.lock) and deploy's
-      # helm bump are pushed with it, and its pushes trigger no workflow. If a release flow
-      # ever pushes with a PAT or App token, it must add its own guard (e.g. skip when the
-      # head commit is `chore: release`), or it re-runs and re-pushes the same version.
+      # the checks, and then ships like any other push — the angular preset bumps at least a
+      # patch for every commit type, chore(deps) included; use `fix(deps):` so CHANGELOG.md
+      # lists it. That makes the GITHUB_TOKEN rule the ONLY loop-breaker — the release commit
+      # (CHANGELOG.md, package.json, Cargo.toml, Cargo.lock) and deploy's helm bump are
+      # pushed with it, and its pushes trigger no workflow. If a release flow ever pushes with
+      # a PAT or App token, it must add its own guard (e.g. skip when the head commit is
+      # `chore: release`), or it re-runs and re-pushes the same version.
       - '**.md'
       - 'helm/**'
       - 'package.json'

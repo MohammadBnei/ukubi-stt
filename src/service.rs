@@ -272,8 +272,10 @@ impl SttService {
     pub async fn warm_streaming(&self) {
         match self.handle().await {
             Ok(_) => tracing::info!("streaming model warm"),
-            Err(e) => tracing::warn!(
-                "streaming model failed to warm ({e}); batch is unaffected and \
+            // The cause is already logged by errkeys::model_unavailable; `e`
+            // holds only the public text.
+            Err(_) => tracing::warn!(
+                "streaming model failed to warm; batch is unaffected and \
                  streaming requests will retry the load"
             ),
         }
@@ -441,7 +443,6 @@ impl SttService {
             },
         );
         tracing::info!(
-            session = id,
             sessions = map.len(),
             engine = ?engine,
             "streaming session opened"
@@ -477,6 +478,10 @@ impl SttService {
     /// One chunk of a continuing stream. Returns only the NEW text — this model
     /// does not revise past output, which is why the response carries no
     /// `is_final` and clients simply concatenate.
+    ///
+    /// The span puts the session on every line logged inside, so an ERROR from
+    /// errkeys::internal can be matched to the caller who saw "internal error".
+    #[tracing::instrument(skip_all, fields(session = session_id))]
     async fn decode_chunk(
         &self,
         session_id: &str,
@@ -512,7 +517,6 @@ impl SttService {
             };
             let Some((recognizer, existing_engine)) = existing else {
                 tracing::info!(
-                    session = session_id,
                     "close for a session already swept or never opened; nothing to flush"
                 );
                 return Ok(String::new());
@@ -525,11 +529,7 @@ impl SttService {
                     .map_err(|e| errkeys::internal("streaming transcription failed", &e))?;
             let mut map = lock(&self.sessions);
             map.remove(session_id);
-            tracing::info!(
-                session = session_id,
-                sessions = map.len(),
-                "streaming session closed"
-            );
+            tracing::info!(sessions = map.len(), "streaming session closed");
             return Ok(text);
         }
 
@@ -538,7 +538,6 @@ impl SttService {
             Some(r) => r,
             None => {
                 tracing::info!(
-                    session = session_id,
                     "close for a session already swept or never opened; nothing to flush"
                 );
                 return Ok(String::new());
@@ -556,11 +555,7 @@ impl SttService {
         if last {
             let mut map = lock(&self.sessions);
             map.remove(session_id);
-            tracing::info!(
-                session = session_id,
-                sessions = map.len(),
-                "streaming session closed"
-            );
+            tracing::info!(sessions = map.len(), "streaming session closed");
         }
         Ok(text)
     }

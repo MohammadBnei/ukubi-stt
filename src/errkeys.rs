@@ -19,6 +19,8 @@
 use crate::service::pb::ErrorKey;
 use prost::Message;
 use std::fmt::Display;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use tonic::{Code, Status};
 
 /// Keys whose message is written by this service, for the caller. The two keys
@@ -81,15 +83,41 @@ pub fn internal(what: &str, err: &dyn Display) -> Status {
 }
 
 /// A lazily loaded model that would not load. WARN, not ERROR: batch is
-/// unaffected, and every streaming request retries the load, so this repeats per
-/// request while the model is missing. The caller learns which model, not why.
+/// unaffected. Every streaming request retries the load, so the WARN is kept to
+/// one per model per `WARN_EVERY` and the repeats go to DEBUG; otherwise a
+/// missing model logs at the clients' chunk rate. The caller learns which
+/// model, not why.
 pub fn model_unavailable(model: &'static str, err: &dyn Display) -> Status {
-    tracing::warn!("{model} failed to load: {err:#}");
+    if warn_due(model, Instant::now()) {
+        tracing::warn!("{model} failed to load: {err:#}");
+    } else {
+        tracing::debug!("{model} failed to load: {err:#}");
+    }
     build(
         Code::FailedPrecondition,
         MODEL_UNAVAILABLE,
         format!("the {model} is not available on this server"),
     )
+}
+
+const WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// True when `model`'s last WARN is older than `WARN_EVERY` (or there is none),
+/// and records `now` as its last WARN.
+fn warn_due(model: &'static str, now: Instant) -> bool {
+    static LAST: Mutex<Vec<(&'static str, Instant)>> = Mutex::new(Vec::new());
+    let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
+    match last.iter_mut().find(|(m, _)| *m == model) {
+        Some((_, at)) if now.duration_since(*at) < WARN_EVERY => false,
+        Some((_, at)) => {
+            *at = now;
+            true
+        }
+        None => {
+            last.push((model, now));
+            true
+        }
+    }
 }
 
 /// `google.rpc.Status`, the payload of `grpc-status-details-bin`. Three fields;
@@ -236,6 +264,16 @@ mod tests {
         // Positive control: the error does carry the text the caller must not see.
         assert!(format!("{err:#}").contains("secret"));
         assert!(!msg.contains("secret") && !msg.contains("/models"));
+    }
+
+    #[test]
+    fn a_failing_model_warns_once_per_interval() {
+        let t = Instant::now();
+        assert!(warn_due("test model", t));
+        assert!(!warn_due("test model", t + Duration::from_secs(1)));
+        assert!(warn_due("other test model", t), "per model");
+        assert!(warn_due("test model", t + WARN_EVERY));
+        assert!(!warn_due("test model", t + WARN_EVERY));
     }
 
     /// The GPU-only paths cannot run in a test, so their routing is pinned by

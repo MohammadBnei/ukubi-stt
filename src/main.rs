@@ -22,7 +22,7 @@ mod service;
 use anyhow::{Context, Result};
 use service::pb::stt_server::SttServer;
 use std::{net::SocketAddr, path::PathBuf};
-use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::{fmt::writer::BoxMakeWriter, util::SubscriberInitExt};
 
 const GRPC_ADDR: &str = "0.0.0.0:9090";
 const HEALTH_ADDR: &str = "0.0.0.0:8080";
@@ -37,11 +37,16 @@ fn main() -> Result<()> {
     // construction; RUST_LOG still overrides, and an invalid one falls back.
     // Serve logs JSON lines on stdout. A selftest's stdout is its report, so its
     // logs go to stderr (still JSON).
-    let filter = config
+    const DEFAULT_FILTER: &str = "info,ort=debug";
+    let (filter, bad_filter) = match config
         .log_filter
         .as_deref()
-        .and_then(|s| tracing_subscriber::EnvFilter::try_new(s).ok())
-        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info,ort=debug"));
+        .map(tracing_subscriber::EnvFilter::try_new)
+    {
+        Some(Ok(f)) => (f, None),
+        Some(Err(e)) => (tracing_subscriber::EnvFilter::new(DEFAULT_FILTER), Some(e)),
+        None => (tracing_subscriber::EnvFilter::new(DEFAULT_FILTER), None),
+    };
     let writer = if logs_to_stdout(&config.mode) {
         BoxMakeWriter::new(std::io::stdout)
     } else {
@@ -49,7 +54,20 @@ fn main() -> Result<()> {
     };
     // init(), not set_global_default: it also installs the `log` bridge.
     logs(filter, writer).init();
+    if let Some(e) = bad_filter {
+        tracing::warn!("RUST_LOG is invalid, using {DEFAULT_FILTER}: {e}");
+    }
 
+    // A fatal error is the line that explains a crash loop, so it is a JSON
+    // ERROR like every other line, not anyhow's plain text on stderr.
+    if let Err(e) = run(config) {
+        tracing::error!("{e:#}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run(config: config::Config) -> Result<()> {
     let config::Config {
         mode,
         model_dir,
@@ -254,25 +272,20 @@ fn logs_to_stdout(mode: &config::Mode) -> bool {
 }
 
 /// One JSON object per line: `timestamp`, `level`, `message` and the event's
-/// fields at the top level, then `target` and the enclosing spans. Loki reads
+/// fields at the top level, then `target` and the current span. Loki reads
 /// `level` as detected_level, which is what log-error-rate-spike counts.
-fn logs<W>(
+fn logs(
     filter: tracing_subscriber::EnvFilter,
-    writer: W,
-) -> tracing_subscriber::fmt::SubscriberBuilder<
-    tracing_subscriber::fmt::format::JsonFields,
-    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Json>,
-    tracing_subscriber::EnvFilter,
-    W,
->
-where
-    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
-{
+    writer: BoxMakeWriter,
+) -> impl tracing::Subscriber + Send + Sync {
+    // ponytail: one span level (decode_chunk), so `span` alone; the list repeats it.
     tracing_subscriber::fmt()
         .json()
         .flatten_event(true)
+        .with_span_list(false)
         .with_env_filter(filter)
         .with_writer(writer)
+        .finish()
 }
 
 /// Blocking `main` on purpose: the model loads and CUDA is asserted *before*
@@ -443,10 +456,10 @@ mod tests {
     fn logs_are_json_lines_with_their_level() {
         let buf = Buf::default();
         let sink = buf.clone();
-        let subscriber = super::logs(tracing_subscriber::EnvFilter::new("info"), move || {
-            sink.clone()
-        })
-        .finish();
+        let subscriber = super::logs(
+            tracing_subscriber::EnvFilter::new("info"),
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(move || sink.clone()),
+        );
         let credentials =
             match crate::config::Config::load([], [("STT_AUTH_TOKEN".into(), "x".into())])
                 .unwrap()
@@ -480,6 +493,7 @@ mod tests {
         assert_eq!(levels, ["ERROR", "WARN", "INFO"], "{text}");
         assert_eq!(lines[0]["message"], "what: boom");
         assert_eq!(lines[0]["span"]["session"], "s1");
+        assert!(lines[0].get("spans").is_none(), "{text}");
         assert_eq!(
             lines[1]["message"],
             "log format test model failed to load: gone"

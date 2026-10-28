@@ -438,7 +438,7 @@ A value under any `STT_*` name or `RUST_LOG` that is not valid UTF-8 refuses to
 start. Error messages name a token's variable, never its value.
 
 Logs are JSON, one object per line: `timestamp`, `level`, `message` and the
-event's fields, then `target` and the enclosing spans (tracing-subscriber's
+event's fields, then `target` and the current span (tracing-subscriber's
 keys). Serve writes them to stdout; the `--selftest*` modes write them to
 stderr, because their stdout is the report.
 

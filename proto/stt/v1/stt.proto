@@ -19,6 +19,23 @@ service Stt {
   rpc Recognize(RecognizeRequest) returns (RecognizeResponse);
 }
 
+// Attached to every error this service returns, as the one detail of the
+// google.rpc.Status in grpc-status-details-bin. Branch on the status code and
+// `key`, never on the message. Same shape as ukubi.errors.v1.ErrorKey.
+//
+// Keys: auth.unauthenticated, request.bad_sample_rate, request.empty_audio,
+// request.bad_audio, language.unknown, session.engine_mismatch,
+// session.cap_reached, gpu.busy, model.unavailable, server.internal. An
+// INTERNAL error's message is always "internal error"; the cause is in the
+// server log. Errors raised before the handler runs (body too large, unknown
+// method) carry no detail.
+message ErrorKey {
+  // Stable, dotted, lowercase. src/errkeys.rs is the registry.
+  string key = 1;
+  // Whose words the message holds, when not this service's. Empty today.
+  string source = 2;
+}
+
 message RecognitionConfig {
   // 16000 only. The model is 16 kHz mono; anything else is rejected rather
   // than resampled, because a silently resampled request returns a plausible

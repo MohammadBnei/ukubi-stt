@@ -1897,6 +1897,7 @@ dependencies = [
  "ort",
  "parakeet-rs",
  "prost",
+ "prost-types",
  "realfft",
  "serde_json",
  "subtle",

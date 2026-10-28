@@ -1,4 +1,11 @@
-# The environment is read in exactly one place: config::Config::from_process.
+# Two bans share this lint.
+#
+# 1. A tonic::Status is built in exactly one place: src/errkeys.rs, which attaches
+#    the stt.v1.ErrorKey detail and keeps internal text off the wire. Its one
+#    #[expect] is a single-expression fn. from_header_map stays allowed (it parses,
+#    tests use it); tonic's From<io::Error>/From<h2::Error> cannot be listed here.
+#
+# 2. The environment is read in exactly one place: config::Config::from_process.
 # Every other reader is refused here, so `cargo clippy -- -D warnings` (CI)
 # fails on one. Clippy resolves each call to its definition, so a renamed or
 # grouped import is caught the same as a full path. Exemptions are #[expect] /
@@ -8,6 +15,29 @@
 # A path here that does not resolve is only a warning, not an error, so a typo
 # silently unbans it: check clippy's output for "does not refer to a reachable".
 disallowed-methods = [
+    { path = "tonic::Status::new", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::ok", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::cancelled", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::unknown", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::invalid_argument", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::deadline_exceeded", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::not_found", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::already_exists", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::permission_denied", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::resource_exhausted", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::failed_precondition", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::aborted", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::out_of_range", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::unimplemented", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::internal", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::unavailable", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::data_loss", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::unauthenticated", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::with_details", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::with_metadata", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::with_details_and_metadata", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::from_error", reason = "build a Status through errkeys" },
+    { path = "tonic::Status::try_from_error", reason = "build a Status through errkeys" },
     { path = "std::env::var", reason = "read config through config::Config" },
     { path = "std::env::var_os", reason = "read config through config::Config" },
     { path = "std::env::vars", reason = "read config through config::Config" },

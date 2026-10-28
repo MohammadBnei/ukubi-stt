@@ -632,6 +632,7 @@ mod tests {
                 "build.rs",
                 "src/config.rs",
                 "src/engine.rs",
+                "src/errkeys.rs",
                 "src/fbank.rs",
                 "src/main.rs",
                 "src/persian.rs",
@@ -682,12 +683,16 @@ mod tests {
         );
         // config.rs: from_process. engine.rs: gpu_used_mib (exec) and one test.
         // main.rs: its test module. build.rs: OUT_DIR at build time.
+        // errkeys.rs: the one Status constructor, a single-expression fn, so the
+        // same lint's env ban is lifted for nothing else; the std-env count in the
+        // next test still holds errkeys.rs at zero.
         assert_eq!(
             count_in_sources(concat!("disallowed", "_methods")),
             counts(&[
                 ("build.rs", 1),
                 ("src/config.rs", 1),
                 ("src/engine.rs", 2),
+                ("src/errkeys.rs", 1),
                 ("src/main.rs", 1),
             ])
         );

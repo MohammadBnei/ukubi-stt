@@ -4,6 +4,7 @@
 use crate::engine::{
     is_multilingual, load_streaming_and_assert_cuda, pcm_s16le_to_f32, SAMPLE_RATE,
 };
+use crate::errkeys::{self, Key};
 use crate::persian::{PersianModel, PersianStream};
 use parakeet_rs::{Nemotron, NemotronHandle, ParakeetTDT, Transcriber};
 use std::{
@@ -271,8 +272,10 @@ impl SttService {
     pub async fn warm_streaming(&self) {
         match self.handle().await {
             Ok(_) => tracing::info!("streaming model warm"),
-            Err(e) => tracing::warn!(
-                "streaming model failed to warm ({e}); batch is unaffected and \
+            // The cause is already logged by errkeys::model_unavailable; `e`
+            // holds only the public text.
+            Err(_) => tracing::warn!(
+                "streaming model failed to warm; batch is unaffected and \
                  streaming requests will retry the load"
             ),
         }
@@ -287,10 +290,10 @@ impl SttService {
         let dir = self.stream_dir.clone();
         let handle = tokio::task::spawn_blocking(move || load_streaming_and_assert_cuda(&dir))
             .await
-            .map_err(|e| Status::internal(format!("streaming model load task failed: {e}")))?
+            .map_err(|e| errkeys::internal("streaming model load task failed", &e))?
             // failed_precondition, not internal: either the model is missing or
             // the card could not hold both, and neither is fixed by retrying.
-            .map_err(|e| Status::failed_precondition(format!("{e:#}")))?;
+            .map_err(|e| errkeys::model_unavailable("streaming model", &e))?;
         *guard = Some(handle.clone());
         Ok(handle)
     }
@@ -311,8 +314,8 @@ impl SttService {
             PersianModel::load(&dir, crate::persian::Device::Cpu)
         })
         .await
-        .map_err(|e| Status::internal(format!("Persian model load task failed: {e}")))?
-        .map_err(|e| Status::failed_precondition(format!("{e:#}")))?;
+        .map_err(|e| errkeys::internal("Persian model load task failed", &e))?
+        .map_err(|e| errkeys::model_unavailable("Persian model", &e))?;
         let model = Arc::new(Mutex::new(model));
         *guard = Some(Arc::clone(&model));
         tracing::info!("Persian model loaded (CPU)");
@@ -366,11 +369,14 @@ impl SttService {
             // decoding on the WRONG MODEL, which is the failure this whole change
             // exists to remove — so say so instead.
             if existing.engine != engine {
-                return Err(Status::invalid_argument(format!(
-                    "session {id} was opened for {:?} and cannot switch to {engine:?} \
+                return Err(errkeys::status(
+                    Key::EngineMismatch,
+                    format!(
+                        "session {id} was opened for {:?} and cannot switch to {engine:?} \
                      mid-stream — close it with `last: true` and open a new session_id",
-                    existing.engine
-                )));
+                        existing.engine
+                    ),
+                ));
             }
             existing.last_used = now;
             return Ok(Some(Arc::clone(&existing.recognizer)));
@@ -379,11 +385,14 @@ impl SttService {
             return Ok(None);
         }
         if map.len() >= self.max_sessions {
-            return Err(Status::resource_exhausted(format!(
-                "{} streaming sessions already active — there is one GPU. Retry, or send \
+            return Err(errkeys::status(
+                Key::SessionCapReached,
+                format!(
+                    "{} streaming sessions already active — there is one GPU. Retry, or send \
                  `last: true` on sessions you have finished with.",
-                self.max_sessions
-            )));
+                    self.max_sessions
+                ),
+            ));
         }
 
         let recognizer = match loaded {
@@ -399,15 +408,17 @@ impl SttService {
                     // would let `ar_AR` route correctly and then fail here, where
                     // today it decodes — so the canonical spelling is resolved
                     // before the call, not after.
-                    let canonical = canonical_language(handle, language).ok_or_else(|| {
-                        Status::invalid_argument(format!(
-                            "language {language:?} is not one this model knows"
-                        ))
-                    })?;
+                    let unknown = || {
+                        errkeys::status(
+                            Key::UnknownLanguage,
+                            format!("language {language:?} is not one this model knows"),
+                        )
+                    };
+                    let canonical = canonical_language(handle, language).ok_or_else(unknown)?;
+                    // parakeet-rs's own words are logged, not sent.
                     rec.set_target_lang(canonical).map_err(|e| {
-                        Status::invalid_argument(format!(
-                            "language {language:?} is not one this model knows: {e}"
-                        ))
+                        tracing::warn!("set_target_lang({canonical}): {e}");
+                        unknown()
                     })?;
                 }
                 Recognizer::Nemotron {
@@ -432,7 +443,6 @@ impl SttService {
             },
         );
         tracing::info!(
-            session = id,
             sessions = map.len(),
             engine = ?engine,
             "streaming session opened"
@@ -449,7 +459,8 @@ impl SttService {
         // GPU converts overload into unbounded latency, which is harder to
         // diagnose than a clean RESOURCE_EXHAUSTED.
         let _permit = self.permits.clone().try_acquire_owned().map_err(|_| {
-            Status::resource_exhausted(
+            errkeys::status(
+                Key::GpuBusy,
                 "the GPU is busy with another batch decode — one at a time, by design. Retry.",
             )
         })?;
@@ -459,14 +470,18 @@ impl SttService {
             lock(&model).transcribe_samples(samples, SAMPLE_RATE, 1, None)
         })
         .await
-        .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
-        .map_err(|e| Status::internal(format!("transcription failed: {e}")))?;
+        .map_err(|e| errkeys::internal("decode task failed", &e))?
+        .map_err(|e| errkeys::internal("transcription failed", &e))?;
         Ok(result.text)
     }
 
     /// One chunk of a continuing stream. Returns only the NEW text — this model
     /// does not revise past output, which is why the response carries no
     /// `is_final` and clients simply concatenate.
+    ///
+    /// The span puts the session on every line logged inside, so an ERROR from
+    /// errkeys::internal can be matched to the caller who saw "internal error".
+    #[tracing::instrument(skip_all, fields(session = session_id))]
     async fn decode_chunk(
         &self,
         session_id: &str,
@@ -502,7 +517,6 @@ impl SttService {
             };
             let Some((recognizer, existing_engine)) = existing else {
                 tracing::info!(
-                    session = session_id,
                     "close for a session already swept or never opened; nothing to flush"
                 );
                 return Ok(String::new());
@@ -511,17 +525,11 @@ impl SttService {
             let text =
                 tokio::task::spawn_blocking(move || lock(&recognizer).transcribe(samples, true))
                     .await
-                    .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
-                    .map_err(|e| {
-                        Status::internal(format!("streaming transcription failed: {e}"))
-                    })?;
+                    .map_err(|e| errkeys::internal("decode task failed", &e))?
+                    .map_err(|e| errkeys::internal("streaming transcription failed", &e))?;
             let mut map = lock(&self.sessions);
             map.remove(session_id);
-            tracing::info!(
-                session = session_id,
-                sessions = map.len(),
-                "streaming session closed"
-            );
+            tracing::info!(sessions = map.len(), "streaming session closed");
             return Ok(text);
         }
 
@@ -530,7 +538,6 @@ impl SttService {
             Some(r) => r,
             None => {
                 tracing::info!(
-                    session = session_id,
                     "close for a session already swept or never opened; nothing to flush"
                 );
                 return Ok(String::new());
@@ -542,20 +549,48 @@ impl SttService {
         // to the model whose behaviour it describes.
         let text = tokio::task::spawn_blocking(move || lock(&recognizer).transcribe(samples, last))
             .await
-            .map_err(|e| Status::internal(format!("decode task failed: {e}")))?
-            .map_err(|e| Status::internal(format!("streaming transcription failed: {e}")))?;
+            .map_err(|e| errkeys::internal("decode task failed", &e))?
+            .map_err(|e| errkeys::internal("streaming transcription failed", &e))?;
 
         if last {
             let mut map = lock(&self.sessions);
             map.remove(session_id);
-            tracing::info!(
-                session = session_id,
-                sessions = map.len(),
-                "streaming session closed"
-            );
+            tracing::info!(sessions = map.len(), "streaming session closed");
         }
         Ok(text)
     }
+}
+
+/// The checks on a request that need no model, in the order the caller meets
+/// them: sample rate, then empty audio, then whole 16-bit samples.
+fn validate(cfg: &pb::RecognitionConfig, audio: &[u8], last: bool) -> Result<Vec<f32>, Status> {
+    // 0 means "unset" in proto3 and is treated as "the only rate we
+    // support". Any other value is rejected rather than resampled: a
+    // silently resampled request returns a plausible transcript and a
+    // meaningless real-time factor, and the RTF is how a caller detects
+    // that this service has fallen back to CPU.
+    if cfg.sample_rate_hertz != 0 && cfg.sample_rate_hertz != SAMPLE_RATE as i32 {
+        return Err(errkeys::status(
+            Key::BadSampleRate,
+            format!(
+                "sample_rate_hertz must be {SAMPLE_RATE} (or 0 for the default); got {}. \
+             Resample before sending: ffmpeg -i in -ar 16000 -ac 1 out.wav",
+                cfg.sample_rate_hertz
+            ),
+        ));
+    }
+    // Empty audio is an error EXCEPT as a bare close. `last` means "flush
+    // and release", and a client that stops recording on an exact chunk
+    // boundary — 1 callback in 35, plus every Stop before speaking — has
+    // nothing left to send but still needs the session flushed and closed.
+    // Rejecting it leaked the recognizer until the idle sweep and dropped
+    // the tail, which is the bug the padding in Recognizer::transcribe exists
+    // to prevent.
+    if audio.is_empty() && !last {
+        return Err(errkeys::status(Key::EmptyAudio, "audio is empty"));
+    }
+
+    pcm_s16le_to_f32(audio).map_err(|e| errkeys::status(Key::BadAudio, e.to_string()))
 }
 
 #[tonic::async_trait]
@@ -572,30 +607,7 @@ impl pb::stt_server::Stt for SttService {
         let req = request.into_inner();
         let cfg = req.config.unwrap_or_default();
 
-        // 0 means "unset" in proto3 and is treated as "the only rate we
-        // support". Any other value is rejected rather than resampled: a
-        // silently resampled request returns a plausible transcript and a
-        // meaningless real-time factor, and the RTF is how a caller detects
-        // that this service has fallen back to CPU.
-        if cfg.sample_rate_hertz != 0 && cfg.sample_rate_hertz != SAMPLE_RATE as i32 {
-            return Err(Status::invalid_argument(format!(
-                "sample_rate_hertz must be {SAMPLE_RATE} (or 0 for the default); got {}. \
-                 Resample before sending: ffmpeg -i in -ar 16000 -ac 1 out.wav",
-                cfg.sample_rate_hertz
-            )));
-        }
-        // Empty audio is an error EXCEPT as a bare close. `last` means "flush
-        // and release", and a client that stops recording on an exact chunk
-        // boundary — 1 callback in 35, plus every Stop before speaking — has
-        // nothing left to send but still needs the session flushed and closed.
-        // Rejecting it leaked the recognizer until the idle sweep and dropped
-        // the tail, which is the bug the padding below exists to prevent.
-        if req.audio.is_empty() && !req.last {
-            return Err(Status::invalid_argument("audio is empty"));
-        }
-
-        let samples =
-            pcm_s16le_to_f32(&req.audio).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let samples = validate(&cfg, &req.audio, req.last)?;
         let audio_seconds = samples.len() as f32 / SAMPLE_RATE as f32;
 
         let started = Instant::now();
@@ -671,13 +683,20 @@ impl Interceptor for BearerAuth {
         let value = request
             .metadata()
             .get("authorization")
-            .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?
+            .ok_or_else(|| errkeys::status(Key::Unauthenticated, "missing authorization metadata"))?
             .to_str()
-            .map_err(|_| Status::unauthenticated("authorization is not valid ASCII"))?;
+            .map_err(|_| {
+                errkeys::status(Key::Unauthenticated, "authorization is not valid ASCII")
+            })?;
 
         let presented = value
             .strip_prefix("Bearer ")
-            .ok_or_else(|| Status::unauthenticated("authorization must be `Bearer <token>`"))?
+            .ok_or_else(|| {
+                errkeys::status(
+                    Key::Unauthenticated,
+                    "authorization must be `Bearer <token>`",
+                )
+            })?
             .as_bytes();
 
         // Every credential is compared, with no early exit on the first match:
@@ -698,7 +717,7 @@ impl Interceptor for BearerAuth {
                     .insert(ClientName(name.to_string()));
                 Ok(request)
             }
-            None => Err(Status::unauthenticated("invalid token")),
+            None => Err(errkeys::status(Key::Unauthenticated, "invalid token")),
         }
     }
 }
@@ -755,6 +774,106 @@ pub async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ask(v: Option<&[u8]>) -> Result<Request<()>, Status> {
+        let mut auth = BearerAuth {
+            clients: Arc::new(vec![("default".into(), b"a".to_vec())]),
+        };
+        let mut r = Request::new(());
+        if let Some(v) = v {
+            let v = tonic::metadata::AsciiMetadataValue::try_from(v).unwrap();
+            r.metadata_mut().insert("authorization", v);
+        }
+        auth.call(r)
+    }
+
+    fn check(sample_rate_hertz: i32, audio: &[u8], last: bool) -> Result<Vec<f32>, Status> {
+        let cfg = pb::RecognitionConfig {
+            sample_rate_hertz,
+            language: String::new(),
+        };
+        validate(&cfg, audio, last)
+    }
+
+    /// The wire golden: what a caller decodes for every refusal that needs no
+    /// model. The model-load and internal paths are in errkeys.rs's tests and the
+    /// real-server proof.
+    #[test]
+    fn refusals_carry_their_key_on_the_wire() {
+        use tonic::Code::{InvalidArgument, Unauthenticated};
+        let cases: Vec<(&str, Status, tonic::Code, &str, &str)> = vec![
+            (
+                "auth.missing",
+                ask(None).unwrap_err(),
+                Unauthenticated,
+                "missing authorization metadata",
+                "auth.unauthenticated",
+            ),
+            (
+                "auth.non-ascii",
+                ask(Some(b"\xff")).unwrap_err(),
+                Unauthenticated,
+                "authorization is not valid ASCII",
+                "auth.unauthenticated",
+            ),
+            (
+                "auth.not-bearer",
+                ask(Some(b"Basic a")).unwrap_err(),
+                Unauthenticated,
+                "authorization must be `Bearer <token>`",
+                "auth.unauthenticated",
+            ),
+            (
+                "auth.wrong-token",
+                ask(Some(b"Bearer nope")).unwrap_err(),
+                Unauthenticated,
+                "invalid token",
+                "auth.unauthenticated",
+            ),
+            (
+                "bad.sample-rate",
+                check(8000, &[0; 2], false).unwrap_err(),
+                InvalidArgument,
+                "sample_rate_hertz must be 16000 (or 0 for the default); got 8000. \
+              Resample before sending: ffmpeg -i in -ar 16000 -ac 1 out.wav",
+                "request.bad_sample_rate",
+            ),
+            (
+                "bad.empty-audio",
+                check(0, &[], false).unwrap_err(),
+                InvalidArgument,
+                "audio is empty",
+                "request.empty_audio",
+            ),
+            (
+                "bad.odd-bytes",
+                check(0, &[0; 3], false).unwrap_err(),
+                InvalidArgument,
+                "audio is 3 bytes, which is not a whole number of 16-bit samples \u{2014} \
+              expected mono little-endian s16 PCM",
+                "request.bad_audio",
+            ),
+        ];
+        for (name, status, code, msg, key) in cases {
+            let got = crate::errkeys::read_back(status);
+            assert_eq!(
+                got,
+                (code, msg.to_string(), key.to_string(), String::new()),
+                "{name}"
+            );
+        }
+    }
+
+    /// Positive controls for the golden: what must still pass.
+    #[test]
+    fn good_requests_pass() {
+        let ok = ask(Some(b"Bearer a")).unwrap();
+        assert_eq!(ok.extensions().get::<ClientName>().unwrap().0, "default");
+        assert_eq!(check(0, &[0; 4], false).unwrap().len(), 2);
+        assert_eq!(check(16000, &[0; 2], false).unwrap().len(), 1);
+        // The bare close: empty audio with `last`.
+        assert!(check(0, &[], true).unwrap().is_empty());
+    }
 
     // ponytail: the parsing branch only. Everything else in this module needs a
     // loaded model and a GPU.

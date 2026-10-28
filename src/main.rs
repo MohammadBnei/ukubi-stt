@@ -14,6 +14,7 @@
 
 mod config;
 mod engine;
+mod errkeys;
 mod fbank;
 mod persian;
 mod service;

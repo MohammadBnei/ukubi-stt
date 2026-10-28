@@ -709,7 +709,8 @@ mod tests {
         );
         assert_eq!(
             count_in_sources(concat!("errkeys::", "internal(")),
-            counts(&[("src/service.rs", 8)])
+            // main.rs: the log format test.
+            counts(&[("src/main.rs", 1), ("src/service.rs", 8)])
         );
         assert_eq!(count_in_sources(concat!("Level::", "ERROR")), counts(&[]));
     }

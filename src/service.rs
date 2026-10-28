@@ -558,6 +558,35 @@ impl SttService {
     }
 }
 
+/// The checks on a request that need no model, in the order the caller meets
+/// them: sample rate, then empty audio, then whole 16-bit samples.
+fn validate(cfg: &pb::RecognitionConfig, audio: &[u8], last: bool) -> Result<Vec<f32>, Status> {
+    // 0 means "unset" in proto3 and is treated as "the only rate we
+    // support". Any other value is rejected rather than resampled: a
+    // silently resampled request returns a plausible transcript and a
+    // meaningless real-time factor, and the RTF is how a caller detects
+    // that this service has fallen back to CPU.
+    if cfg.sample_rate_hertz != 0 && cfg.sample_rate_hertz != SAMPLE_RATE as i32 {
+        return Err(Status::invalid_argument(format!(
+            "sample_rate_hertz must be {SAMPLE_RATE} (or 0 for the default); got {}. \
+             Resample before sending: ffmpeg -i in -ar 16000 -ac 1 out.wav",
+            cfg.sample_rate_hertz
+        )));
+    }
+    // Empty audio is an error EXCEPT as a bare close. `last` means "flush
+    // and release", and a client that stops recording on an exact chunk
+    // boundary — 1 callback in 35, plus every Stop before speaking — has
+    // nothing left to send but still needs the session flushed and closed.
+    // Rejecting it leaked the recognizer until the idle sweep and dropped
+    // the tail, which is the bug the padding in Recognizer::transcribe exists
+    // to prevent.
+    if audio.is_empty() && !last {
+        return Err(Status::invalid_argument("audio is empty"));
+    }
+
+    pcm_s16le_to_f32(audio).map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
 #[tonic::async_trait]
 impl pb::stt_server::Stt for SttService {
     async fn recognize(
@@ -572,30 +601,7 @@ impl pb::stt_server::Stt for SttService {
         let req = request.into_inner();
         let cfg = req.config.unwrap_or_default();
 
-        // 0 means "unset" in proto3 and is treated as "the only rate we
-        // support". Any other value is rejected rather than resampled: a
-        // silently resampled request returns a plausible transcript and a
-        // meaningless real-time factor, and the RTF is how a caller detects
-        // that this service has fallen back to CPU.
-        if cfg.sample_rate_hertz != 0 && cfg.sample_rate_hertz != SAMPLE_RATE as i32 {
-            return Err(Status::invalid_argument(format!(
-                "sample_rate_hertz must be {SAMPLE_RATE} (or 0 for the default); got {}. \
-                 Resample before sending: ffmpeg -i in -ar 16000 -ac 1 out.wav",
-                cfg.sample_rate_hertz
-            )));
-        }
-        // Empty audio is an error EXCEPT as a bare close. `last` means "flush
-        // and release", and a client that stops recording on an exact chunk
-        // boundary — 1 callback in 35, plus every Stop before speaking — has
-        // nothing left to send but still needs the session flushed and closed.
-        // Rejecting it leaked the recognizer until the idle sweep and dropped
-        // the tail, which is the bug the padding below exists to prevent.
-        if req.audio.is_empty() && !req.last {
-            return Err(Status::invalid_argument("audio is empty"));
-        }
-
-        let samples =
-            pcm_s16le_to_f32(&req.audio).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let samples = validate(&cfg, &req.audio, req.last)?;
         let audio_seconds = samples.len() as f32 / SAMPLE_RATE as f32;
 
         let started = Instant::now();

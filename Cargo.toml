@@ -77,6 +77,8 @@ opentelemetry = { version = "0.33", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
+# HeaderExtractor for the caller's traceparent; already in the graph via otlp.
+opentelemetry-http = { version = "0.33", default-features = false }
 tower-http = { version = "0.7", default-features = false, features = ["trace"] }
 # Our own client rather than the SDK's, for .no_proxy(): reqwest reads
 # HTTP_PROXY and friends even without its system-proxy feature.

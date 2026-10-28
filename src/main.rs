@@ -65,7 +65,12 @@ fn start(config: config::Config, run: impl FnOnce(config::Config, bool) -> Resul
     };
     // Before the logger, because the OTel layer is part of it. Its error waits
     // for the logger to be reported.
-    let (traces, traces_failed) = match config.traces_endpoint.as_deref().map(traces::Tracing::new)
+    // Serve only: a selftest makes no gRPC span.
+    let (traces, traces_failed) = match config
+        .traces_endpoint
+        .as_deref()
+        .filter(|_| matches!(config.mode, config::Mode::Serve { .. }))
+        .map(traces::Tracing::new)
     {
         Some(Ok(t)) => (Some(t), None),
         Some(Err(e)) => (None, Some(e)),
@@ -332,7 +337,10 @@ where
 {
     use tracing_subscriber::{filter::FilterExt as _, Layer as _};
     let not_the_call_span =
-        tracing_subscriber::filter::filter_fn(|m| m.target() != traces::SPAN_TARGET);
+        tracing_subscriber::filter::filter_fn(|m| m.target() != traces::SPAN_TARGET)
+            // No level of its own. Without a hint `and` has none either, and
+            // the global max level (and LogTracer's) falls to TRACE.
+            .with_max_level_hint(tracing::level_filters::LevelFilter::TRACE);
     // ponytail: one span level (decode_chunk), so `span` alone; the list repeats it.
     tracing_subscriber::fmt::layer()
         .json()
@@ -542,6 +550,21 @@ mod tests {
     /// The format Loki parses, through the real log sites: one JSON object per
     /// line with its level, the message words unchanged, fields at the top level
     /// and the session span kept on an ERROR raised inside it.
+    /// The log layer keeps RUST_LOG's level as its hint, so the global max
+    /// level (and LogTracer's) is not TRACE.
+    #[test]
+    fn logs_keep_the_filter_level_hint() {
+        use tracing_subscriber::Layer as _;
+        let layer = super::logs::<tracing_subscriber::Registry>(
+            tracing_subscriber::EnvFilter::new("info,ort=debug"),
+            super::BoxMakeWriter::new(std::io::sink),
+        );
+        assert_eq!(
+            layer.max_level_hint(),
+            Some(tracing::level_filters::LevelFilter::DEBUG)
+        );
+    }
+
     #[test]
     fn logs_are_json_lines_with_their_level() {
         let buf = Buf::default();
@@ -863,14 +886,16 @@ mod tests {
     /// reach the collector before that (the batch delay is an hour, so only
     /// the shutdown flush exports).
     fn serve_child(rt: &tokio::runtime::Runtime, got: &Got, env: &[(&str, String)]) -> Vec<String> {
-        let port = || {
-            std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        };
-        let (grpc, health) = (port(), port());
+        // Both held at once, so the two ports differ. ponytail: another
+        // process can still take one before the child binds it; have the
+        // child bind :0 and report its ports if CI ever flakes on this.
+        let bind = || std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (a, b) = (bind(), bind());
+        let (grpc, health) = (
+            a.local_addr().unwrap().port(),
+            b.local_addr().unwrap().port(),
+        );
+        drop((a, b));
         let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args(["--exact", "tests::traces_child", "--ignored"]);
         // The shell's own OTEL_* settings must not reach the child.

@@ -2278,6 +2278,7 @@ dependencies = [
  "hound",
  "http",
  "opentelemetry",
+ "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry-proto",
  "opentelemetry_sdk",

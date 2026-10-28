@@ -183,30 +183,26 @@ const TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 /// tracing (owner, 2026-10-28: an optional setting that is set and invalid
 /// warns and takes its default). https warns too: this build carries no TLS
 /// client. A value with an `@` (a user:password, which belongs in
-/// OTEL_EXPORTER_OTLP_HEADERS) is refused and never echoed.
+/// OTEL_EXPORTER_OTLP_HEADERS) is refused. One with an `@`, `?` or `#` is
+/// never echoed.
 fn traces_endpoint(raw: Option<&str>) -> Result<Option<String>, String> {
     let Some(raw) = raw.filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
-    let shown = if raw.contains('@') {
-        "<redacted: contains @>".to_string()
+    // A secret rides in userinfo or the query; neither is echoed.
+    let secret = raw.contains(['@', '?', '#']);
+    let shown = if secret {
+        "<redacted: contains @, ? or #>".to_string()
     } else {
         format!("{raw:?}")
     };
     let uri = raw.parse::<http::Uri>().ok();
-    let path = uri.as_ref().map(|u| u.path()).unwrap_or_default();
-    match uri.as_ref().and_then(|u| u.scheme_str()) {
-        Some("https") => Err(format!(
+    match uri.as_ref().map(|u| (u.scheme_str(), u.host(), u.path())) {
+        Some((Some("https"), ..)) => Err(format!(
             "{TRACES_ENDPOINT} {shown} is https, and this build has no TLS client; tracing is off"
         )),
-        Some("http")
-            if !raw.contains('@')
-                && uri
-                    .as_ref()
-                    .and_then(|u| u.host())
-                    .is_some_and(|h| !h.is_empty())
-                && !path.is_empty()
-                && path != "/" =>
+        Some((Some("http"), Some(host), path))
+            if !raw.contains('@') && !host.is_empty() && !path.is_empty() && path != "/" =>
         {
             Ok(Some(raw.to_string()))
         }
@@ -703,11 +699,19 @@ mod tests {
             "http://user:pass@c/v1/traces",
             "user:pass@c",
             "https://u:p@c/v1/traces",
+            "https://c/v1/traces?api_key=pass",
+            "http://c?api_key=pass",
+            "u:p#c",
         ] {
             let w = warns(secret);
-            assert!(w.contains("<redacted: contains @>"), "{w}");
+            assert!(w.contains("<redacted: contains @, ? or #>"), "{w}");
             assert!(!w.contains("pass") && !w.contains("u:p"), "{w}");
         }
+        // A query on a valid endpoint is passed on, not refused.
+        assert_eq!(
+            on("http://c/v1/traces?k=v").as_deref(),
+            Some("http://c/v1/traces?k=v")
+        );
         // Beside a real error: the error still refuses, the warning is not
         // what refuses.
         assert_eq!(

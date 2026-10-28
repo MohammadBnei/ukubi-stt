@@ -6,7 +6,7 @@
 //! error handler) is set. The SDK's internal-logs feature is off, so it writes
 //! no log lines of its own; an export failure is one WARN from [`WarnOnFailure`].
 
-use opentelemetry::propagation::{Extractor, TextMapPropagator as _};
+use opentelemetry::propagation::TextMapPropagator as _;
 use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
 use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use opentelemetry_sdk::error::OTelSdkResult;
@@ -30,11 +30,6 @@ pub const METHODS: [&str; 3] = [
     "grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
     "grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo",
 ];
-
-/// gRPC codes that are the server's fault, so the span's status is ERROR. A
-/// client's own fault (UNAUTHENTICATED, INVALID_ARGUMENT, ...) stays Unset.
-/// UNKNOWN, DEADLINE_EXCEEDED, UNIMPLEMENTED, INTERNAL, UNAVAILABLE, DATA_LOSS.
-const SERVER_FAULTS: [i64; 6] = [2, 4, 12, 13, 14, 15];
 
 pub struct Tracing(SdkTracerProvider);
 
@@ -123,7 +118,7 @@ pub fn make_span<B>(request: &http::Request<B>) -> Span {
         rpc.grpc.status_code = tracing::field::Empty,
     );
     let caller = opentelemetry_sdk::propagation::TraceContextPropagator::new()
-        .extract(&Headers(request.headers()));
+        .extract(&opentelemetry_http::HeaderExtractor(request.headers()));
     let caller = caller.span().span_context().clone();
     if caller.is_valid() {
         span.add_link(caller);
@@ -147,24 +142,25 @@ pub fn on_eos(trailers: Option<&http::HeaderMap>, _: Duration, span: &Span) {
 fn record(headers: &http::HeaderMap, span: &Span) {
     let Some(code) = headers
         .get("grpc-status")
-        .and_then(|v| v.to_str().ok()?.parse::<i64>().ok())
+        .and_then(|v| v.to_str().ok()?.parse::<i32>().ok())
     else {
         return;
     };
     span.record("rpc.grpc.status_code", code);
-    if SERVER_FAULTS.contains(&code) {
+    // The server's faults, per the OTel gRPC semconv, are ERROR. A client's
+    // own fault (UNAUTHENTICATED, INVALID_ARGUMENT, ...) stays Unset, and so
+    // does FAILED_PRECONDITION (model_unavailable): its WARN line covers it.
+    use tonic::Code;
+    if matches!(
+        Code::from_i32(code),
+        Code::Unknown
+            | Code::DeadlineExceeded
+            | Code::Unimplemented
+            | Code::Internal
+            | Code::Unavailable
+            | Code::DataLoss
+    ) {
         span.record("otel.status_code", "ERROR");
-    }
-}
-
-struct Headers<'a>(&'a http::HeaderMap);
-
-impl Extractor for Headers<'_> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key)?.to_str().ok()
-    }
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(http::HeaderName::as_str).collect()
     }
 }
 

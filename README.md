@@ -438,7 +438,7 @@ argument refuses to start.
 
 A value under any `STT_*` name or `RUST_LOG` that is not valid UTF-8 refuses to
 start. Error messages name a token's variable, never its value; a traces
-endpoint with an `@` in it is never echoed either.
+endpoint with an `@`, `?` or `#` in it is never echoed either.
 
 Logs are JSON, one object per line: `timestamp`, `level`, `message` and the
 event's fields, then `target` and the current span (tracing-subscriber's

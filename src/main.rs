@@ -18,18 +18,29 @@ mod errkeys;
 mod fbank;
 mod persian;
 mod service;
+mod traces;
 
 use anyhow::{Context, Result};
 use service::pb::stt_server::SttServer;
 use std::{net::SocketAddr, path::PathBuf};
-use tracing_subscriber::{fmt::writer::BoxMakeWriter, util::SubscriberInitExt};
+use tracing_subscriber::{
+    fmt::writer::BoxMakeWriter, layer::SubscriberExt as _, util::SubscriberInitExt,
+};
 
 const GRPC_ADDR: &str = "0.0.0.0:9090";
 const HEALTH_ADDR: &str = "0.0.0.0:8080";
 
 fn main() -> Result<()> {
     let config = config::Config::from_process()?;
+    start(config, run);
+    Ok(())
+}
 
+/// Everything after the config is read: the logger, traces when set, `run`,
+/// and the flush. The traces test's child calls this too, with its own `run`,
+/// so the install and the shutdown it proves are the ones main runs. `run`
+/// gets whether traces are on. Exits 1 on its error, after the flush.
+fn start(config: config::Config, run: impl FnOnce(config::Config, bool) -> Result<()>) {
     // ORT names the provider it registered and the one it declined, with the
     // reason, at debug level. Without a subscriber those events are dropped and
     // a CUDA failure is indistinguishable from a CUDA success that used no
@@ -52,22 +63,49 @@ fn main() -> Result<()> {
     } else {
         BoxMakeWriter::new(std::io::stderr)
     };
+    // Before the logger, because the OTel layer is part of it. Its error waits
+    // for the logger to be reported.
+    let (traces, traces_failed) = match config.traces_endpoint.as_deref().map(traces::Tracing::new)
+    {
+        Some(Ok(t)) => (Some(t), None),
+        Some(Err(e)) => (None, Some(e)),
+        None => (None, None),
+    };
     // init(), not set_global_default: it also installs the `log` bridge.
-    logs(filter, writer).init();
+    tracing_subscriber::registry()
+        .with(logs(filter, writer))
+        .with(traces.as_ref().map(traces::Tracing::layer))
+        .init();
     if let Some(e) = bad_filter {
         tracing::warn!("RUST_LOG is invalid, using {DEFAULT_FILTER}: {e}");
+    }
+    for w in &config.warnings {
+        tracing::warn!("{w}");
+    }
+    if let Some(e) = traces_failed {
+        tracing::warn!("tracing is off: {e:#}");
     }
 
     // A fatal error is the line that explains a crash loop, so it is a JSON
     // ERROR like every other line, not anyhow's plain text on stderr.
-    if let Err(e) = run(config) {
+    let traced = traces.is_some();
+    let result = run(config, traced);
+    if let Err(e) = &result {
         tracing::error!("{e:#}");
+    }
+    // After run, so after the server has drained: the span of a call still in
+    // flight at SIGTERM is closed by now. exit(1) skips destructors, so the
+    // flush has to come before it. ponytail: a panic out of run skips it, and
+    // the spans still queued are lost.
+    if let Some(t) = traces {
+        t.shutdown();
+    }
+    if result.is_err() {
         std::process::exit(1);
     }
-    Ok(())
 }
 
-fn run(config: config::Config) -> Result<()> {
+fn run(config: config::Config, traced: bool) -> Result<()> {
     let config::Config {
         mode,
         model_dir,
@@ -76,6 +114,8 @@ fn run(config: config::Config) -> Result<()> {
         fa_device,
         max_sessions,
         log_filter: _,
+        traces_endpoint: _,
+        warnings: _,
     } = config;
     match mode {
         config::Mode::Selftest { wav } => selftest(&model_dir, wav),
@@ -83,9 +123,14 @@ fn run(config: config::Config) -> Result<()> {
         config::Mode::SelftestFa { wav, reference } => {
             selftest_fa(&fa_dir, fa_device, wav, reference)
         }
-        config::Mode::Serve { credentials } => {
-            serve(&model_dir, stream_dir, fa_dir, credentials, max_sessions)
-        }
+        config::Mode::Serve { credentials } => serve(
+            &model_dir,
+            stream_dir,
+            fa_dir,
+            credentials,
+            max_sessions,
+            traced,
+        ),
     }
 }
 
@@ -274,18 +319,27 @@ fn logs_to_stdout(mode: &config::Mode) -> bool {
 /// One JSON object per line: `timestamp`, `level`, `message` and the event's
 /// fields at the top level, then `target` and the current span. Loki reads
 /// `level` as detected_level, which is what log-error-rate-spike counts.
-fn logs(
+///
+/// The filter is this layer's own, not the subscriber's, so the OTel layer
+/// beside it keeps its own; and this layer never sees the gRPC call span, so
+/// a line logged inside a traced call is the line logged without traces.
+fn logs<S>(
     filter: tracing_subscriber::EnvFilter,
     writer: BoxMakeWriter,
-) -> impl tracing::Subscriber + Send + Sync {
+) -> impl tracing_subscriber::Layer<S> + Send + Sync
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    use tracing_subscriber::{filter::FilterExt as _, Layer as _};
+    let not_the_call_span =
+        tracing_subscriber::filter::filter_fn(|m| m.target() != traces::SPAN_TARGET);
     // ponytail: one span level (decode_chunk), so `span` alone; the list repeats it.
-    tracing_subscriber::fmt()
+    tracing_subscriber::fmt::layer()
         .json()
         .flatten_event(true)
         .with_span_list(false)
-        .with_env_filter(filter)
         .with_writer(writer)
-        .finish()
+        .with_filter(filter.and(not_the_call_span))
 }
 
 /// Blocking `main` on purpose: the model loads and CUDA is asserted *before*
@@ -297,6 +351,7 @@ fn serve(
     fa_dir: PathBuf,
     credentials: config::Credentials,
     max_sessions: usize,
+    traced: bool,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -339,42 +394,77 @@ fn serve(
         let warm = std::sync::Arc::clone(&svc);
         tokio::spawn(async move { warm.warm_streaming().await });
 
-        let inner = SttServer::from_arc(svc).max_decoding_message_size(service::MAX_DECODE_BYTES);
-        let authed = tonic::service::interceptor::InterceptedService::new(inner, auth);
-
-        // Reflection, so an in-cluster caller can discover the API without
-        // being handed a .proto first. Registered UNAUTHENTICATED and that
-        // is deliberate rather than an oversight: the IngressRoute matches
-        // PathPrefix(`/stt.v1.Stt/`) while reflection answers on
-        // `/grpc.reflection.v1.*`, so Traefik 404s it and only the pod
-        // network can reach it. The schema is public on GitHub anyway; what
-        // it must not do is become a second externally-reachable surface.
-        //
-        // v1 and v1alpha both: grpcurl and older tooling disagree on which
-        // they ask for, and serving one of them is the kind of thing that
-        // looks fine until someone else's client fails.
-        let reflection_v1 = tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(service::FILE_DESCRIPTOR_SET)
-            .build_v1()?;
-        let reflection_v1alpha = tonic_reflection::server::Builder::configure()
-            .register_encoded_file_descriptor_set(service::FILE_DESCRIPTOR_SET)
-            .build_v1alpha()?;
-
-        tracing::info!("gRPC listening on {grpc}");
-        tonic::transport::Server::builder()
-            .add_service(authed)
-            .add_service(reflection_v1)
-            .add_service(reflection_v1alpha)
-            // Recreate is mandatory for this Deployment (the new pod would
-            // request the only nvidia.com/gpu while the old one holds it),
-            // so a clean SIGTERM shutdown is what keeps the gap short.
-            // ponytail: the drain is unbounded. Idle connections and unary
-            // RPCs finish at once; a live bidi stream holds it open until
-            // the client stops or SIGKILL lands. Add a timeout if that bites.
-            .serve_with_shutdown(grpc, shutdown)
-            .await
-            .map_err(anyhow::Error::from)
+        serve_grpc(svc, auth, grpc, shutdown, traced).await
     })
+}
+
+/// `svc` behind the bearer check, with reflection beside it, until `shutdown`
+/// has fired and every call has finished. The traces test serves a stand-in
+/// `Stt` through this, so what it proves is this wiring.
+async fn serve_grpc<S: service::pb::stt_server::Stt>(
+    svc: std::sync::Arc<S>,
+    auth: service::BearerAuth,
+    grpc: SocketAddr,
+    shutdown: impl std::future::Future<Output = ()>,
+    traced: bool,
+) -> Result<()> {
+    let inner = SttServer::from_arc(svc).max_decoding_message_size(service::MAX_DECODE_BYTES);
+    let authed = tonic::service::interceptor::InterceptedService::new(inner, auth);
+
+    // Reflection, so an in-cluster caller can discover the API without
+    // being handed a .proto first. Registered UNAUTHENTICATED and that
+    // is deliberate rather than an oversight: the IngressRoute matches
+    // PathPrefix(`/stt.v1.Stt/`) while reflection answers on
+    // `/grpc.reflection.v1.*`, so Traefik 404s it and only the pod
+    // network can reach it. The schema is public on GitHub anyway; what
+    // it must not do is become a second externally-reachable surface.
+    //
+    // v1 and v1alpha both: grpcurl and older tooling disagree on which
+    // they ask for, and serving one of them is the kind of thing that
+    // looks fine until someone else's client fails.
+    let reflection_v1 = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(service::FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+    let reflection_v1alpha = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(service::FILE_DESCRIPTOR_SET)
+        .build_v1alpha()?;
+    let routes = tonic::service::Routes::new(authed)
+        .add_service(reflection_v1)
+        .add_service(reflection_v1alpha);
+
+    tracing::info!("gRPC listening on {grpc}");
+    // Recreate is mandatory for this Deployment (the new pod would
+    // request the only nvidia.com/gpu while the old one holds it),
+    // so a clean SIGTERM shutdown is what keeps the gap short.
+    // ponytail: the drain is unbounded. Idle connections and unary
+    // RPCs finish at once; a live bidi stream holds it open until
+    // the client stops or SIGKILL lands. Add a timeout if that bites.
+    //
+    // Two arms, not option_layer: the traced response body is another type,
+    // and with traces unset the server must have no layer at all. Every
+    // tower-http log event is off (its default logs ERROR for any non-OK
+    // gRPC status, which log-error-rate-spike would count).
+    let mut server = tonic::transport::Server::builder();
+    if traced {
+        let layer = tower_http::trace::TraceLayer::new_for_grpc()
+            .make_span_with(traces::make_span)
+            .on_request(())
+            .on_response(traces::on_response)
+            .on_body_chunk(())
+            .on_eos(traces::on_eos)
+            .on_failure(());
+        server
+            .layer(layer)
+            .add_routes(routes)
+            .serve_with_shutdown(grpc, shutdown)
+            .await?;
+    } else {
+        server
+            .add_routes(routes)
+            .serve_with_shutdown(grpc, shutdown)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Resolves on SIGTERM or SIGINT, then logs which. Both handlers are installed
@@ -456,9 +546,12 @@ mod tests {
     fn logs_are_json_lines_with_their_level() {
         let buf = Buf::default();
         let sink = buf.clone();
-        let subscriber = super::logs(
-            tracing_subscriber::EnvFilter::new("info"),
-            tracing_subscriber::fmt::writer::BoxMakeWriter::new(move || sink.clone()),
+        let subscriber = tracing_subscriber::layer::SubscriberExt::with(
+            tracing_subscriber::registry(),
+            super::logs(
+                tracing_subscriber::EnvFilter::new("info"),
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new(move || sink.clone()),
+            ),
         );
         let credentials =
             match crate::config::Config::load([], [("STT_AUTH_TOKEN".into(), "x".into())])
@@ -597,5 +690,476 @@ mod tests {
             };
             assert!(status.success(), "SIG{sig}: child ended with {status}");
         }
+    }
+
+    const TRACES_CHILD: &str = "UKUBI_STT_TRACES_CHILD";
+    const CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+    const CALLER_SPAN: &str = "b7ad6b7169203331";
+
+    /// A stand-in for SttService, so the child needs no model. It logs inside
+    /// the call (once outside any span of ours, once inside a decode_chunk
+    /// span) so the fmt and OTel filters both have something to drop, and
+    /// takes its behaviour from `session_id`.
+    struct StandIn;
+
+    #[tonic::async_trait]
+    impl crate::service::pb::stt_server::Stt for StandIn {
+        async fn recognize(
+            &self,
+            request: tonic::Request<crate::service::pb::RecognizeRequest>,
+        ) -> Result<tonic::Response<crate::service::pb::RecognizeResponse>, tonic::Status> {
+            tracing::info!("stand-in recognize");
+            tracing::info_span!("decode_chunk", session = "s")
+                .in_scope(|| tracing::info!("stand-in chunk"));
+            match request.get_ref().session_id.as_str() {
+                "internal" => return Err(tonic::Status::internal("stand-in fault")),
+                "slow" => {
+                    tracing::info!("stand-in slow call started");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                _ => {}
+            }
+            Ok(tonic::Response::new(Default::default()))
+        }
+    }
+
+    /// Not a test on its own: the child that `traces_reach_a_collector_and_unset_is_inert`
+    /// spawns. It runs main's `start` (logger, traces, flush) around the real
+    /// `serve_grpc` and `serve_http`, with the stand-in for the model.
+    #[test]
+    #[ignore]
+    fn traces_child() {
+        let Ok(ports) = std::env::var(TRACES_CHILD) else {
+            return;
+        };
+        let (grpc, health) = ports.split_once(',').unwrap();
+        let grpc: std::net::SocketAddr = format!("127.0.0.1:{grpc}").parse().unwrap();
+        let health: std::net::SocketAddr = format!("127.0.0.1:{health}").parse().unwrap();
+        let config = crate::config::Config::load([], std::env::vars_os()).unwrap();
+        super::start(config, |config, traced| {
+            let crate::config::Mode::Serve { credentials } = config.mode else {
+                panic!("not serve");
+            };
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            let shutdown = {
+                let _rt = rt.enter();
+                super::shutdown_signal()?
+            };
+            let auth = crate::service::BearerAuth::new(credentials);
+            rt.block_on(async move {
+                tokio::spawn(crate::service::serve_http(health));
+                super::serve_grpc(std::sync::Arc::new(StandIn), auth, grpc, shutdown, traced).await
+            })
+        });
+    }
+
+    type Got = std::sync::Arc<
+        std::sync::Mutex<
+            Vec<opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest>,
+        >,
+    >;
+
+    /// An OTLP/HTTP collector: POST /v1/traces, protobuf in, empty answer out.
+    async fn collector(got: Got) -> std::net::SocketAddr {
+        let app = axum::Router::new().route(
+            "/v1/traces",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let got = got.clone();
+                async move {
+                    got.lock()
+                        .unwrap()
+                        .push(prost::Message::decode(body).unwrap());
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/x-protobuf")],
+                        Vec::<u8>::new(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// One unary call; the code it ended with.
+    async fn unary(
+        channel: tonic::transport::Channel,
+        path: &'static str,
+        token: &str,
+        session: &str,
+        traceparent: Option<&str>,
+    ) -> tonic::Code {
+        let mut grpc = tonic::client::Grpc::new(channel);
+        grpc.ready().await.unwrap();
+        let mut request = tonic::Request::new(crate::service::pb::RecognizeRequest {
+            session_id: session.into(),
+            ..Default::default()
+        });
+        let md = request.metadata_mut();
+        md.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        if let Some(tp) = traceparent {
+            md.insert("traceparent", tp.parse().unwrap());
+        }
+        let codec = tonic_prost::ProstCodec::<
+            crate::service::pb::RecognizeRequest,
+            crate::service::pb::RecognizeResponse,
+        >::default();
+        let path = tonic::codegen::http::uri::PathAndQuery::from_static(path);
+        match grpc.unary(request, path, codec).await {
+            Ok(_) => tonic::Code::Ok,
+            Err(s) => s.code(),
+        }
+    }
+
+    /// One reflection `list`, read to its end so the stream's trailers arrive.
+    async fn reflection_list(channel: tonic::transport::Channel) {
+        use tonic_reflection::pb::v1::{
+            server_reflection_request::MessageRequest, ServerReflectionRequest,
+            ServerReflectionResponse,
+        };
+        let mut grpc = tonic::client::Grpc::new(channel);
+        grpc.ready().await.unwrap();
+        let request = tonic::Request::new(tonic::codegen::tokio_stream::once(
+            ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::ListServices(String::new())),
+            },
+        ));
+        let codec =
+            tonic_prost::ProstCodec::<ServerReflectionRequest, ServerReflectionResponse>::default();
+        let path = tonic::codegen::http::uri::PathAndQuery::from_static(
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+        );
+        let mut answers = grpc
+            .streaming(request, path, codec)
+            .await
+            .unwrap()
+            .into_inner();
+        let mut n = 0;
+        while answers.message().await.unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 1);
+    }
+
+    fn http_get(port: u16, path: &str) -> String {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    }
+
+    /// Runs one child with `env`, makes the same calls to it, and returns its
+    /// log lines. A slow call is in flight when SIGTERM lands; nothing may
+    /// reach the collector before that (the batch delay is an hour, so only
+    /// the shutdown flush exports).
+    fn serve_child(rt: &tokio::runtime::Runtime, got: &Got, env: &[(&str, String)]) -> Vec<String> {
+        let port = || {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let (grpc, health) = (port(), port());
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "tests::traces_child", "--ignored"]);
+        // The shell's own OTEL_* settings must not reach the child.
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("OTEL_") {
+                cmd.env_remove(k);
+            }
+        }
+        cmd.env(TRACES_CHILD, format!("{grpc},{health}"))
+            .env("STT_AUTH_TOKEN", "good")
+            .env("OTEL_BSP_SCHEDULE_DELAY", "3600000")
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .stdout(std::process::Stdio::piped());
+        let mut child = Reap(cmd.spawn().unwrap());
+        let stdout = child.0.stdout.take().unwrap();
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let reader = {
+            let lines = lines.clone();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for l in std::io::BufReader::new(stdout).lines() {
+                    lines.lock().unwrap().push(l.unwrap());
+                }
+            })
+        };
+
+        let endpoint =
+            tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{grpc}")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let channel = loop {
+            match rt.block_on(endpoint.connect()) {
+                Ok(c) => break c,
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "child never served: {e}");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        let traceparent = format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01");
+        let recognize = "/stt.v1.Stt/Recognize";
+        let c = || channel.clone();
+        rt.block_on(async {
+            assert_eq!(
+                unary(c(), recognize, "good", "ok", Some(&traceparent)).await,
+                tonic::Code::Ok
+            );
+            assert_eq!(
+                unary(c(), recognize, "bad", "ok", None).await,
+                tonic::Code::Unauthenticated
+            );
+            assert_eq!(
+                unary(c(), recognize, "good", "internal", None).await,
+                tonic::Code::Internal
+            );
+            assert_eq!(
+                unary(c(), "/stt.v1.Stt/Nope", "good", "ok", None).await,
+                tonic::Code::Unimplemented
+            );
+            reflection_list(c()).await;
+        });
+        for path in ["/healthz", "/livez"] {
+            let answer = http_get(health, path);
+            assert!(answer.starts_with("HTTP/1.1 200"), "{path}: {answer}");
+        }
+
+        let slow = rt.spawn(unary(c(), recognize, "good", "slow", None));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("stand-in slow call started"))
+        {
+            assert!(Instant::now() < deadline, "the slow call never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            got.lock().unwrap().is_empty(),
+            "exported before shutdown: the flush is not what is being proved"
+        );
+        let kill = format!("kill -TERM {}", child.0.id());
+        assert!(Command::new("sh")
+            .args(["-c", &kill])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(rt.block_on(slow).unwrap(), tonic::Code::Ok, "drained");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(s) = child.0.try_wait().unwrap() {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "still running after SIGTERM");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "child ended with {status}");
+        reader.join().unwrap();
+        let lines = lines.lock().unwrap().clone();
+        // The test harness's own lines are not logs.
+        lines.into_iter().filter(|l| l.starts_with('{')).collect()
+    }
+
+    /// A log line with its timestamp dropped and its ports blanked, so two
+    /// children's lines compare.
+    fn masked(line: &str) -> String {
+        let mut v: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        v.as_object_mut().unwrap().remove("timestamp");
+        let text = v.to_string();
+        let mut parts = text.split("127.0.0.1:");
+        let mut out = parts.next().unwrap().to_string();
+        for p in parts {
+            out.push_str("127.0.0.1:<port>");
+            out.push_str(p.trim_start_matches(|c: char| c.is_ascii_digit()));
+        }
+        out
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Standard §7, through main's own `start` and the real `serve_grpc` and
+    /// `serve_http`: with the variable set, one server span per gRPC call and
+    /// none for an unknown method or the probes; each span a new root linked
+    /// to the caller; exported by the shutdown flush, after a call in flight
+    /// at SIGTERM has finished; log lines the same as with it unset. With only
+    /// OTEL_EXPORTER_OTLP_ENDPOINT set, nothing is exported at all (the traced
+    /// child, against the same collector, is that check's positive control).
+    #[test]
+    fn traces_reach_a_collector_and_unset_is_inert() {
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        use opentelemetry_proto::tonic::trace::v1::{span::SpanKind, status::StatusCode};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let got = Got::default();
+        let addr = rt.block_on(collector(got.clone()));
+
+        let traced = serve_child(
+            &rt,
+            &got,
+            &[(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                format!("http://{addr}/v1/traces"),
+            )],
+        );
+        let exports = std::mem::take(&mut *got.lock().unwrap());
+        let inert = serve_child(
+            &rt,
+            &got,
+            &[("OTEL_EXPORTER_OTLP_ENDPOINT", format!("http://{addr}"))],
+        );
+        assert!(got.lock().unwrap().is_empty(), "unset is not inert");
+
+        // Logs: the same lines with traces on and off. No tower-http or OTel
+        // line, no ERROR (log-error-rate-spike), and no `span` key on a line
+        // logged inside the call but outside decode_chunk.
+        for lines in [&traced, &inert] {
+            assert!(
+                lines.iter().any(|l| l.contains("shutting down")),
+                "{lines:?}"
+            );
+            for l in lines.iter() {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                let target = v["target"].as_str().unwrap();
+                assert!(target.starts_with("ukubi_stt"), "{l}");
+                assert_ne!(v["level"], "ERROR", "{l}");
+                if v["message"] == "stand-in recognize" {
+                    assert!(v.get("span").is_none(), "{l}");
+                }
+                if v["message"] == "stand-in chunk" {
+                    assert_eq!(v["span"]["session"], "s", "{l}");
+                }
+            }
+        }
+        let sorted = |lines: &[String]| {
+            let mut m: Vec<String> = lines.iter().map(|l| masked(l)).collect();
+            m.sort();
+            m
+        };
+        assert_eq!(sorted(&traced), sorted(&inert), "log lines changed");
+
+        // Spans.
+        let mut spans = Vec::new();
+        for export in &exports {
+            for rs in &export.resource_spans {
+                let resource = rs.resource.as_ref().unwrap();
+                let attrs: Vec<_> = resource
+                    .attributes
+                    .iter()
+                    .map(|a| {
+                        (
+                            a.key.as_str(),
+                            a.value.as_ref().and_then(|v| v.value.clone()),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    attrs,
+                    [("service.name", Some(Value::StringValue("ukubi-stt".into())))]
+                );
+                for ss in &rs.scope_spans {
+                    spans.extend(ss.spans.iter());
+                }
+            }
+        }
+        let mut names: Vec<&str> = spans.iter().map(|s| s.name.as_str()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+                "stt.v1.Stt/Recognize",
+                "stt.v1.Stt/Recognize",
+                "stt.v1.Stt/Recognize",
+                "stt.v1.Stt/Recognize",
+            ],
+            "one span per call; none for the unknown method, the probes or decode_chunk"
+        );
+        let attr = |s: &opentelemetry_proto::tonic::trace::v1::Span, key: &str| {
+            s.attributes
+                .iter()
+                .find(|a| a.key == key)
+                .and_then(|a| a.value.as_ref()?.value.clone())
+        };
+        let mut trace_ids = std::collections::BTreeSet::new();
+        let mut seen = Vec::new();
+        for s in &spans {
+            assert_eq!(s.kind, SpanKind::Server as i32, "{s:?}");
+            assert!(s.parent_span_id.is_empty(), "a root: {s:?}");
+            assert_ne!(s.trace_id, hex(CALLER_TRACE), "a new trace: {s:?}");
+            assert!(s.events.is_empty(), "no events: {s:?}");
+            trace_ids.insert(s.trace_id.clone());
+            let mut keys: Vec<&str> = s.attributes.iter().map(|a| a.key.as_str()).collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                [
+                    "rpc.grpc.status_code",
+                    "rpc.method",
+                    "rpc.service",
+                    "rpc.system"
+                ],
+                "{s:?}"
+            );
+            assert_eq!(
+                attr(s, "rpc.system"),
+                Some(Value::StringValue("grpc".into()))
+            );
+            let (service, method) = s.name.split_once('/').unwrap();
+            assert_eq!(
+                attr(s, "rpc.service"),
+                Some(Value::StringValue(service.into()))
+            );
+            assert_eq!(
+                attr(s, "rpc.method"),
+                Some(Value::StringValue(method.into()))
+            );
+            let Some(Value::IntValue(code)) = attr(s, "rpc.grpc.status_code") else {
+                panic!("{s:?}");
+            };
+            let status = s.status.as_ref().map_or(0, |st| st.code);
+            for l in &s.links {
+                assert_eq!(
+                    (l.trace_id.clone(), l.span_id.clone()),
+                    (hex(CALLER_TRACE), hex(CALLER_SPAN))
+                );
+            }
+            seen.push((method, code, status, s.links.len()));
+        }
+        assert_eq!(trace_ids.len(), spans.len(), "every call its own trace");
+        seen.sort();
+        let (unset, error) = (StatusCode::Unset as i32, StatusCode::Error as i32);
+        assert_eq!(
+            seen,
+            [
+                ("Recognize", 0, unset, 0),  // the slow call, in flight at SIGTERM
+                ("Recognize", 0, unset, 1),  // the caller's traceparent, linked
+                ("Recognize", 13, error, 0), // INTERNAL is the server's fault
+                ("Recognize", 16, unset, 0), // UNAUTHENTICATED is the caller's
+                ("ServerReflectionInfo", 0, unset, 0),
+            ]
+        );
     }
 }

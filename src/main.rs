@@ -243,9 +243,21 @@ fn selftest(model_dir: &std::path::Path, audio: Option<PathBuf>) -> Result<()> {
 }
 
 /// Blocking `main` on purpose: the model loads and CUDA is asserted *before*
-/// any runtime or listener exists. There is no window in which this process is
-/// reachable but cannot decode.
+/// any listener exists. There is no window in which this process is reachable
+/// but cannot decode.
 fn serve(model_dir: &std::path::Path, stream_dir: PathBuf, fa_dir: PathBuf) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    // Before the load, not after: as PID 1 the kernel drops any signal that has
+    // no handler, so a SIGTERM during the multi-second load would otherwise be
+    // lost and the pod would sit out the grace period. Registered here, it is
+    // held and the server stops as soon as it starts.
+    let shutdown = {
+        let _rt = rt.enter();
+        shutdown_signal()?
+    };
+
     // Read before the expensive part. A credential problem is a config error and
     // should not cost a 2.4GB model load and a CUDA context to discover.
     let auth = service::BearerAuth::from_env()?;
@@ -255,58 +267,185 @@ fn serve(model_dir: &std::path::Path, stream_dir: PathBuf, fa_dir: PathBuf) -> R
     let grpc: SocketAddr = GRPC_ADDR.parse()?;
     let health: SocketAddr = HEALTH_ADDR.parse()?;
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(async move {
-            tokio::spawn(async move {
-                if let Err(e) = service::serve_http(health).await {
-                    tracing::error!("http listener died: {e}");
-                }
-            });
+    rt.block_on(async move {
+        tokio::spawn(async move {
+            if let Err(e) = service::serve_http(health).await {
+                tracing::error!("http listener died: {e}");
+            }
+        });
 
-            // Shared so a background task can warm the streaming model while the
-            // server is already accepting traffic. from_arc rather than new()
-            // exists for exactly this.
-            let svc = std::sync::Arc::new(service::SttService::new(model, stream_dir, fa_dir));
-            let warm = std::sync::Arc::clone(&svc);
-            tokio::spawn(async move { warm.warm_streaming().await });
+        // Shared so a background task can warm the streaming model while the
+        // server is already accepting traffic. from_arc rather than new()
+        // exists for exactly this.
+        let svc = std::sync::Arc::new(service::SttService::new(model, stream_dir, fa_dir));
+        let warm = std::sync::Arc::clone(&svc);
+        tokio::spawn(async move { warm.warm_streaming().await });
 
-            let inner =
-                SttServer::from_arc(svc).max_decoding_message_size(service::MAX_DECODE_BYTES);
-            let authed = tonic::service::interceptor::InterceptedService::new(inner, auth);
+        let inner = SttServer::from_arc(svc).max_decoding_message_size(service::MAX_DECODE_BYTES);
+        let authed = tonic::service::interceptor::InterceptedService::new(inner, auth);
 
-            // Reflection, so an in-cluster caller can discover the API without
-            // being handed a .proto first. Registered UNAUTHENTICATED and that
-            // is deliberate rather than an oversight: the IngressRoute matches
-            // PathPrefix(`/stt.v1.Stt/`) while reflection answers on
-            // `/grpc.reflection.v1.*`, so Traefik 404s it and only the pod
-            // network can reach it. The schema is public on GitHub anyway; what
-            // it must not do is become a second externally-reachable surface.
-            //
-            // v1 and v1alpha both: grpcurl and older tooling disagree on which
-            // they ask for, and serving one of them is the kind of thing that
-            // looks fine until someone else's client fails.
-            let reflection_v1 = tonic_reflection::server::Builder::configure()
-                .register_encoded_file_descriptor_set(service::FILE_DESCRIPTOR_SET)
-                .build_v1()?;
-            let reflection_v1alpha = tonic_reflection::server::Builder::configure()
-                .register_encoded_file_descriptor_set(service::FILE_DESCRIPTOR_SET)
-                .build_v1alpha()?;
+        // Reflection, so an in-cluster caller can discover the API without
+        // being handed a .proto first. Registered UNAUTHENTICATED and that
+        // is deliberate rather than an oversight: the IngressRoute matches
+        // PathPrefix(`/stt.v1.Stt/`) while reflection answers on
+        // `/grpc.reflection.v1.*`, so Traefik 404s it and only the pod
+        // network can reach it. The schema is public on GitHub anyway; what
+        // it must not do is become a second externally-reachable surface.
+        //
+        // v1 and v1alpha both: grpcurl and older tooling disagree on which
+        // they ask for, and serving one of them is the kind of thing that
+        // looks fine until someone else's client fails.
+        let reflection_v1 = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(service::FILE_DESCRIPTOR_SET)
+            .build_v1()?;
+        let reflection_v1alpha = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(service::FILE_DESCRIPTOR_SET)
+            .build_v1alpha()?;
 
-            tracing::info!("gRPC listening on {grpc}");
+        tracing::info!("gRPC listening on {grpc}");
+        tonic::transport::Server::builder()
+            .add_service(authed)
+            .add_service(reflection_v1)
+            .add_service(reflection_v1alpha)
+            // Recreate is mandatory for this Deployment (the new pod would
+            // request the only nvidia.com/gpu while the old one holds it),
+            // so a clean SIGTERM shutdown is what keeps the gap short.
+            .serve_with_shutdown(grpc, shutdown)
+            .await
+            .map_err(anyhow::Error::from)
+    })
+}
+
+/// Resolves on SIGTERM or SIGINT, then logs which. Both handlers are installed
+/// by this call, not on first poll: the binary is PID 1 (exec-form ENTRYPOINT),
+/// and the kernel ignores SIGTERM for PID 1 while no handler is installed — so
+/// waiting on `ctrl_c()` alone meant every pod stop ran out the grace period and
+/// ended in SIGKILL. Call inside a runtime context.
+// ponytail: unix only. The binary ships in a Linux image; dev is macOS.
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        let signal = tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        };
+        tracing::info!(signal, "shutting down");
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    const CHILD_PORT: &str = "UKUBI_STT_SHUTDOWN_CHILD_PORT";
+
+    /// Kills and reaps the child on every exit path, so a failed assertion
+    /// cannot leave an orphan waiting for a signal.
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Not a test on its own: the body of the child process that
+    /// `signal_stops_a_serving_server` spawns. It is a real tonic server
+    /// (reflection only, so no model) wired exactly as `serve()` wires it.
+    /// Without the env var it returns at once, so `--include-ignored` is safe.
+    #[test]
+    #[ignore]
+    fn shutdown_child() {
+        let Ok(port) = std::env::var(CHILD_PORT) else {
+            return;
+        };
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let shutdown = {
+            let _rt = rt.enter();
+            super::shutdown_signal().unwrap()
+        };
+        let reflection = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(crate::service::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .unwrap();
+        rt.block_on(
             tonic::transport::Server::builder()
-                .add_service(authed)
-                .add_service(reflection_v1)
-                .add_service(reflection_v1alpha)
-                // Recreate is mandatory for this Deployment (the new pod would
-                // request the only nvidia.com/gpu while the old one holds it),
-                // so a clean SIGTERM shutdown is what keeps the gap short.
-                .serve_with_shutdown(grpc, async {
-                    let _ = tokio::signal::ctrl_c().await;
-                    tracing::info!("shutting down");
-                })
-                .await
-                .map_err(anyhow::Error::from)
-        })
+                .add_service(reflection)
+                .serve_with_shutdown(addr, shutdown),
+        )
+        .unwrap();
+    }
+
+    /// The kernel only ignores a signal for PID 1 while no handler is installed,
+    /// so a handler that resolves and lets the server exit is what fixes the pod
+    /// stop. An idle h2 connection is held open across the signal: graceful
+    /// shutdown has to drain it, and a drain that hangs is the other way to fail.
+    #[test]
+    fn signal_stops_a_serving_server() {
+        // The client side of the idle connection needs a runtime that keeps
+        // running (to answer GOAWAY) while this thread polls the child.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        for sig in ["TERM", "INT"] {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let mut child = Reap(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "tests::shutdown_child", "--ignored"])
+                    .env(CHILD_PORT, port.to_string())
+                    .spawn()
+                    .unwrap(),
+            );
+
+            // A served connection means shutdown_signal() already ran: it is
+            // called before the server is built.
+            let endpoint =
+                tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+                    .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let _conn = loop {
+                match rt.block_on(endpoint.connect()) {
+                    Ok(c) => break c,
+                    Err(e) => {
+                        assert!(Instant::now() < deadline, "child never served: {e}");
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            };
+
+            // sh's builtin kill: slim images ship no /usr/bin/kill.
+            let kill = format!("kill -{sig} {}", child.0.id());
+            assert!(Command::new("sh")
+                .args(["-c", &kill])
+                .status()
+                .unwrap()
+                .success());
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(s) = child.0.try_wait().unwrap() {
+                    break s;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "SIG{sig}: still running after 10s"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(status.success(), "SIG{sig}: child ended with {status}");
+        }
+    }
 }

@@ -814,8 +814,10 @@ mod tests {
         }
     }
 
-    /// One reflection `list`, read to its end so the stream's trailers arrive.
-    async fn reflection_list(channel: tonic::transport::Channel) {
+    /// One reflection `list` on `path`, read to its end so the stream's
+    /// trailers arrive. v1alpha's messages are wire-identical to v1's, so the
+    /// v1 types serve both.
+    async fn reflection_list(channel: tonic::transport::Channel, path: &'static str) {
         use tonic_reflection::pb::v1::{
             server_reflection_request::MessageRequest, ServerReflectionRequest,
             ServerReflectionResponse,
@@ -830,9 +832,7 @@ mod tests {
         ));
         let codec =
             tonic_prost::ProstCodec::<ServerReflectionRequest, ServerReflectionResponse>::default();
-        let path = tonic::codegen::http::uri::PathAndQuery::from_static(
-            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
-        );
+        let path = tonic::codegen::http::uri::PathAndQuery::from_static(path);
         let mut answers = grpc
             .streaming(request, path, codec)
             .await
@@ -929,7 +929,12 @@ mod tests {
                 unary(c(), "/stt.v1.Stt/Nope", "good", "ok", None).await,
                 tonic::Code::Unimplemented
             );
-            reflection_list(c()).await;
+            for path in [
+                "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+                "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo",
+            ] {
+                reflection_list(c(), path).await;
+            }
         });
         for path in ["/healthz", "/livez"] {
             let answer = http_get(health, path);
@@ -1090,6 +1095,7 @@ mod tests {
             names,
             [
                 "grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+                "grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo",
                 "stt.v1.Stt/Recognize",
                 "stt.v1.Stt/Recognize",
                 "stt.v1.Stt/Recognize",
@@ -1158,6 +1164,7 @@ mod tests {
                 ("Recognize", 0, unset, 1),  // the caller's traceparent, linked
                 ("Recognize", 13, error, 0), // INTERNAL is the server's fault
                 ("Recognize", 16, unset, 0), // UNAUTHENTICATED is the caller's
+                ("ServerReflectionInfo", 0, unset, 0),
                 ("ServerReflectionInfo", 0, unset, 0),
             ]
         );

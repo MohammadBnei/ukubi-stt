@@ -227,7 +227,10 @@ deployment, on a single-replica pod whose node reboots for gaming.
 
 Map errors before they reach your users: `RESOURCE_EXHAUSTED` (session cap) and
 `FAILED_PRECONDITION` (streaming model not loaded) are both "try later", not
-"you did something wrong".
+"you did something wrong". Branch on the code and, for detail, on the
+`stt.v1.ErrorKey` every error carries in `grpc-status-details-bin` (keys listed
+in `proto/stt/v1/stt.proto`), never on the message. An `INTERNAL` error says
+only `internal error`; the cause is in the server log.
 
 If you expose this to your own frontend over gRPC, use **chunked unary, not
 server-streaming.** A browser cannot stream *up* under any transport gRPC
@@ -401,7 +404,9 @@ error and refuses to start on any of them. `clippy.toml` bans every `std::env`
 reader, the `tracing-subscriber` env constructors and `std::process::Command::new`
 everywhere else; CI's `cargo clippy -D warnings` enforces it, and config.rs's
 tests pin the few exempt sites (the `nvidia-smi` probe in `engine.rs`, which
-inherits the environment; `OUT_DIR` in `build.rs`; test-only code). The ban does
+inherits the environment; `OUT_DIR` in `build.rs`; test-only code; and
+`src/errkeys.rs`, the one place a `tonic::Status` is built, which the same lint
+enforces). The ban does
 not see `libc::getenv`, `/proc/self/environ` or compile-time `env!`. A test also
 holds these two tables to what the loader actually reads.
 

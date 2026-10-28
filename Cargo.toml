@@ -57,6 +57,9 @@ tonic-prost = "0.14"
 # internet does not.
 tonic-reflection = "0.14"
 prost = "0.14"
+# google.protobuf.Any for the error detail (src/errkeys.rs). Already in the graph
+# through tonic-reflection, so this compiles nothing new.
+prost-types = "0.14"
 axum = "0.8"
 
 # Constant-time comparison for the bearer token. Hand-rolling this is four

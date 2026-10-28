@@ -30,8 +30,9 @@ hound = "3.5"
 # additional crates — but transitive availability is not importability, and a
 # transitive version is not a promise. realfft in particular is the same FFT
 # parakeet-rs uses for its own log-mel, so it is already exercised on this
-# hardware. Pinned to the majors parakeet-rs asks for: with no Cargo.lock
-# committed, a future realfft 4.0 would otherwise resolve ours to 4 while it
+# hardware. Pinned to the majors parakeet-rs asks for. Cargo.lock is committed
+# and every build is --locked, so this range guards `cargo update`, not the
+# build: without it a future realfft 4.0 could move ours to 4 while parakeet-rs
 # stayed on 3, compiling both and quietly changing the transform underneath
 # fbank.rs's golden vectors.
 realfft = "3"

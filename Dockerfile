@@ -68,10 +68,15 @@ RUN apt-get update \
       build-essential curl ca-certificates pkg-config libssl-dev protobuf-compiler \
  && rm -rf /var/lib/apt/lists/*
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --default-toolchain stable --profile minimal
+      | sh -s -- -y --default-toolchain none --profile minimal
 ENV PATH=/root/.cargo/bin:$PATH
 
 WORKDIR /src
+# The compiler is the one rust-toolchain.toml pins, not build-day stable. Copied
+# alone and before Cargo.toml, which every release rewrites, so this layer
+# survives a version bump.
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install && rustup show active-toolchain
 # Dependencies first, so a source-only edit does not rebuild the parakeet-rs/ort
 # tree.
 #
@@ -90,7 +95,7 @@ COPY build.rs ./
 COPY proto ./proto
 COPY web ./web
 # include_str!'d by src/fbank.rs (the mel filterbank and its golden fixture).
-# Missing this line compiles fine locally and fails only in the tag build, which
+# Missing this line compiles fine locally and fails only in the image build, which
 # is a 15-minute round trip to learn about a one-line omission.
 COPY assets ./assets
 COPY src ./src

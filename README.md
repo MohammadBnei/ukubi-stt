@@ -66,16 +66,15 @@ bun run release
 
 **`package.json` holds the canonical version and an `after:bump` hook rewrites
 `Cargo.toml` to match.** Two files, one source of truth, because `image.yml`
-reads the version out of `Cargo.toml` and compares it to the pushed tag — if
-they drift the build fails with "does not match the tag", which is the right
-failure but an annoying one to debug.
+reads the image tag out of `Cargo.toml`.
 
-`tagName` is the bare `${version}`, not release-it's default `v${version}`, for
-the same reason: `image.yml` compares it to `github.ref_name` verbatim.
+`tagName` is the bare `${version}`, not release-it's default `v${version}`: the
+build job checks out that tag by the same string it reads from `Cargo.toml`.
 
-The tag push is what builds and pushes the image. There is no deploy step in
-the workflow — ArgoCD picks up `helm/values.yaml` from `main`, so bumping the
-running version is a separate `image.tag` edit there.
+`image.yml` runs this itself on every releasable push to `main`, then builds and
+pushes the image from the new tag, then its deploy job bumps `image.tag` in
+`helm/values.yaml` for ArgoCD to pick up. A local `bun run release` is no
+longer the normal path.
 
 ## Running the gate
 
@@ -460,21 +459,35 @@ against 8GB before Phase E.
 
 ## CI
 
-Two workflows, deliberately split by what they can prove:
+One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below):
 
-| | runs on | proves |
-|---|---|---|
-| `ci.yml` | every PR/push, GitHub-hosted | fmt, clippy, tests, that it compiles |
-| `image.yml` | tags only, build-runner LXC | that it builds into a CUDA image and pushes |
+| job | runs on | when | proves |
+|---|---|---|---|
+| `checks` (`ci.yml`) | GitHub-hosted | PRs and pushes | fmt, clippy, tests, web page parses, `cargo audit`, `buf lint`; `buf breaking` against `main` on PRs only |
+| `release` | GitHub-hosted | pushes | release-it cuts the version, CHANGELOG and tag |
+| `build-push` | build-runner LXC (`[self-hosted, ukubi-build]`) | pushes | that it builds into a CUDA image and pushes |
+| `deploy` | GitHub-hosted | pushes | bumps `image.tag` in `helm/values.yaml` |
 
-`ci.yml` exists because `image.yml` costs ~15 minutes on the LXC pulling a
-multi-GB CUDA tree, and a syntax error should not cost that. It cannot prove
-CUDA engages — no hosted runner has an RTX 2070, which is the whole reason
-Gate 0 runs on real hardware.
+A push to `main` that touches only `*.md`, `helm/**` or `package.json` runs
+nothing. Any other push, a `Cargo.toml`/`Cargo.lock`-only bump included, runs
+the whole pipeline and ships: the angular preset bumps at least a patch for
+every commit type, so even a `chore(deps):` bump cuts a release. Only `feat`,
+`fix`, `perf` and `revert` commits are listed in `CHANGELOG.md`, so commit a
+security bump as `fix(deps):` to have it show there. Nothing after `checks`
+runs if it is red. The checks cannot prove CUDA engages — no hosted runner has
+an RTX 2070, which is the whole reason Gate 0 runs on real hardware.
 
-`cargo audit` is advisory and non-blocking on purpose: this depends on an `ort`
-release candidate by design, so a clean audit is not achievable on demand and a
-permanently-red check trains people to ignore it.
+`cargo audit` is blocking. An advisory we accept goes in `.cargo/audit.toml`
+with its reason and fixed version; today that is two build-time-only crates.
+Warnings (unmaintained, unsound) do not fail it.
+
+`buf breaking` is skipped when a commit in the PR declares `BREAKING CHANGE:`,
+which release-it also reads as a major bump.
+
+**Toolchain.** `rust-toolchain.toml` pins the compiler for CI, the release job,
+the Dockerfile and local builds. Run `rustup toolchain install` once in the repo
+(rustup's auto-install of it is deprecated). To bump, edit that file — nothing
+else names the version.
 
 **Rollback** is redeploying an earlier tag — and this repo's retention is
 tighter than the cluster default: zot keeps the last **2** tags plus `latest`

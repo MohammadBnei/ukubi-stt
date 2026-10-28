@@ -1,0 +1,19 @@
+version: v2
+modules:
+  - path: .
+lint:
+  use:
+    - STANDARD
+  # The service is `Stt`, not `SttService`, and renaming it changes the wire path
+  # /stt.v1.Stt/ that these hard-code: the IngressRoute (helm/values.yaml),
+  # web/index.html (METHOD), agent-fleet's vendored client
+  # (core/internal/sttclient/client.go) and dream-analyst's sttService.ts.
+  # ignore_only on this one file, not `except`, so any new service still gets the rule.
+  ignore_only:
+    SERVICE_SUFFIX:
+      - stt/v1/stt.proto
+breaking:
+  # Same as agent-fleet: PACKAGE, so moving a message between files of one
+  # package is not flagged; anything that changes the wire is.
+  use:
+    - PACKAGE

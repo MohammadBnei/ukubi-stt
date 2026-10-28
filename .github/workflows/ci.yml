@@ -1,7 +1,8 @@
-# Shift the compile check left. image.yml only fires on a tag and takes ~15
-# minutes on the build-runner LXC pulling a multi-GB CUDA tree; a syntax error
-# should not cost that. This runs on every PR and push, on a GitHub-hosted
-# runner, with no GPU involved.
+# Shift the compile check left. The image build takes ~15 minutes on the
+# build-runner LXC pulling a multi-GB CUDA tree; a syntax error should not cost
+# that. image.yml calls this on PRs and on pushes to main that are not
+# docs/helm/package.json only, on GitHub-hosted runners with no GPU, and nothing
+# after it (release, build, deploy) runs if it is red.
 #
 # It cannot prove CUDA engages — that is the startup assertion's job on real
 # hardware, and no hosted runner has an RTX 2070. It proves the code compiles,
@@ -21,6 +22,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # dtolnay/rust-toolchain used to retry flaky downloads; the plain rustup
+  # install below does not, so at least let cargo retry its own.
+  CARGO_NET_RETRY: 10
 
 jobs:
   check:
@@ -28,9 +32,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No arguments: installs exactly what rust-toolchain.toml names, components
+      # included, so that file is the only place the version lives. Before
+      # rust-cache, which keys on the rustc version. The second line fails the job
+      # if the pin is not what is active (e.g. the file was not picked up).
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain | tee /dev/stderr | grep -q 'rust-toolchain.toml'
 
       # tonic-prost-build shells out to protoc, so build.rs fails without it.
       # ubuntu-latest does not ship it. The Dockerfile installs the same
@@ -75,15 +84,53 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      # Advisory-only, and deliberately not blocking: this depends on an ort
-      # release candidate by design (ADR-0044), so a clean audit is not
-      # achievable on demand and a red X here would train people to ignore it.
+        run: cargo install cargo-audit --locked --version 0.22.2
+      # Blocking. A vulnerability fails `checks`, which stops release, build and
+      # deploy on main. An accepted one goes in .cargo/audit.toml with its reason
+      # and fixed version; this step is never made non-blocking. Warnings (unmaintained,
+      # unsound) do not fail it. Two red modes are not advisories: "error loading
+      # advisory database" means the pinned cargo-audit is too old for the DB
+      # format — bump the pin above, do not ignore an ID; and a failed fetch of
+      # the DB from GitHub is transient — re-run.
       - name: Audit
-        run: cargo audit || true
-        continue-on-error: true
+        run: cargo audit
+
+  # The proto contract. Codegen stays in build.rs (tonic-prost-build); this only
+  # lints the schema and refuses wire breaks against main. Same shape as
+  # agent-fleet's go.yml, minus its "no proto/ on main yet" branch.
+  buf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # origin/main for buf breaking and for the BREAKING CHANGE: scan.
+          fetch-depth: 0
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: 1.72.0
+
+      - name: buf lint
+        working-directory: proto
+        run: buf lint
+
+      # PRs only: on a push to main, HEAD is main. A called workflow sees the
+      # caller's event, so this is image.yml's pull_request. A deliberate break
+      # opts out by declaring `BREAKING CHANGE:` in a commit, which release-it
+      # also reads as a major bump — so the skip is visible in the version too.
+      - name: buf breaking (against main)
+        if: github.event_name == 'pull_request'
+        working-directory: proto
+        run: |
+          if git log --format='%B' origin/main..HEAD | grep -q '^BREAKING CHANGE:'; then
+            echo "::notice::skipping buf breaking — a commit declares BREAKING CHANGE:"
+            git log --format='%s' origin/main..HEAD | sed 's/^/  /'
+            exit 0
+          fi
+          buf breaking --against '../.git#ref=origin/main,subdir=proto'

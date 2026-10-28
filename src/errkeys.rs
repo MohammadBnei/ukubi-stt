@@ -193,6 +193,24 @@ mod tests {
         assert_eq!(all.len(), n, "a key string is used twice");
     }
 
+    /// The proto comment is the client-facing key list. Each key must appear
+    /// there as a whole list item (followed by ',' or '.'), so a renamed or
+    /// added key fails here until the list is updated.
+    #[test]
+    fn the_proto_lists_every_key() {
+        let proto = include_str!("../proto/stt/v1/stt.proto");
+        let listed = |k: &str| proto.contains(&format!("{k},")) || proto.contains(&format!("{k}."));
+        for k in ALL
+            .iter()
+            .map(|k| k.as_str())
+            .chain([SERVER_INTERNAL, MODEL_UNAVAILABLE])
+        {
+            assert!(listed(k), "{k} missing from the key list in stt.proto");
+        }
+        // Positive control: a prefix of a listed key is not taken as listed.
+        assert!(!listed("auth.unauth"));
+    }
+
     #[test]
     fn every_key_round_trips_with_matching_code_and_message() {
         for k in ALL {

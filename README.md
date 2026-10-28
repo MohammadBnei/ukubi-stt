@@ -228,8 +228,10 @@ deployment, on a single-replica pod whose node reboots for gaming.
 Map errors before they reach your users: `RESOURCE_EXHAUSTED` (session cap) and
 `FAILED_PRECONDITION` (streaming model not loaded) are both "try later", not
 "you did something wrong". Branch on the code and, for detail, on the
-`stt.v1.ErrorKey` every error carries in `grpc-status-details-bin` (keys listed
-in `proto/stt/v1/stt.proto`), never on the message. An `INTERNAL` error says
+`stt.v1.ErrorKey` in `grpc-status-details-bin` (keys listed in
+`proto/stt/v1/stt.proto`), never on the message. Every error the handler or the
+bearer check returns carries one; errors tonic raises before the handler (body
+too large, unknown method) do not. An `INTERNAL` error says
 only `internal error`; the cause is in the server log.
 
 If you expose this to your own frontend over gRPC, use **chunked unary, not

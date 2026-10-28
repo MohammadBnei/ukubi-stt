@@ -1,0 +1,15 @@
+# Read by `cargo audit` in ci.yml, which is blocking. Every entry here says why it
+# is safe to carry and what version fixes it, so removing it is a mechanical
+# follow-up rather than an investigation. Checked on the shipping target:
+# `cargo tree --target x86_64-unknown-linux-gnu -e normal -i <crate>` is empty
+# for both, i.e. neither crate is linked into the binary.
+[advisories]
+ignore = [
+  # pulldown-cmark 0.13.4, fixed in >=0.13.5. Build-time only: prost-build under
+  # tonic-prost-build ([build-dependencies]) parses comments in our own .proto.
+  "RUSTSEC-2026-0414",
+  # webpki-root-certs 1.0.9, fixed in >=1.0.10. Build-time only: ureq in ort-sys's
+  # build script downloads ONNX Runtime, and ort-sys checks that archive against
+  # the sha256 pinned in its dist.tsv, so the TLS roots are not the integrity check.
+  "RUSTSEC-2026-0383",
+]

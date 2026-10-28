@@ -25,12 +25,14 @@ on:
     branches:
       - main
     paths-ignore:
-      # The release commit touches these, and so does deploy's bump. Pushes made with the
-      # built-in GITHUB_TOKEN do not trigger workflows either, so the loop is closed twice.
+      # Cargo.toml and Cargo.lock are NOT here: a dependency-only security bump has to run
+      # the checks and ship. That makes the GITHUB_TOKEN rule the ONLY loop-breaker — the
+      # release commit (CHANGELOG.md, package.json, Cargo.toml, Cargo.lock) and deploy's
+      # helm bump are pushed with it, and its pushes trigger no workflow. If a release flow
+      # ever pushes with a PAT or App token, it must add its own guard (e.g. skip when the
+      # head commit is `chore: release`), or it re-runs and re-pushes the same version.
       - '**.md'
       - 'helm/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
       - 'package.json'
     tags-ignore:
       - '*'
@@ -69,9 +71,11 @@ jobs:
   # github.release is false — which contents: write covers, so no PAT is involved.
   #
   # Needs cargo on the runner: release-it's after:bump hook seds Cargo.toml and runs
-  # `cargo update`, so package.json and Cargo.toml stay on the same version. ubuntu-latest
-  # ships a toolchain. requireCommits is true with requireCommitsFail false in the config, so
-  # a push with nothing releasable exits clean rather than red.
+  # `cargo update`, so package.json and Cargo.toml stay on the same version. That cargo
+  # obeys rust-toolchain.toml, so the pinned toolchain is installed first rather than left
+  # to rustup's (deprecated) auto-install inside an --offline hook. requireCommits is true
+  # with requireCommitsFail false in the config, so a push with nothing releasable exits
+  # clean rather than red.
   release:
     needs: checks
     if: github.event_name == 'push'
@@ -84,6 +88,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
       - uses: oven-sh/setup-bun@v2
 

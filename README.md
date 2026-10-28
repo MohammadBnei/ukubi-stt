@@ -394,6 +394,47 @@ Releasing above). Merging to `main` builds nothing.
 
 ## Reference
 
+### Configuration
+
+Read once at start by `src/config.rs`, which reports every problem in one
+error and refuses to start on any of them. `clippy.toml` bans every `std::env`
+reader, the `tracing-subscriber` env constructors and `std::process::Command::new`
+everywhere else; CI's `cargo clippy -D warnings` enforces it, and config.rs's
+tests pin the few exempt sites (the `nvidia-smi` probe in `engine.rs`, which
+inherits the environment; `OUT_DIR` in `build.rs`; test-only code). The ban does
+not see `libc::getenv`, `/proc/self/environ` or compile-time `env!`. A test also
+holds these two tables to what the loader actually reads.
+
+| Argument | Mode |
+|---|---|
+| *(none)* | serve gRPC on `:9090`, page and health on `:8080` |
+| `--selftest [wav]` | load the batch model, assert CUDA, transcribe the WAV or a synthetic sweep |
+| `--selftest-stream` | load both models and report total GPU use |
+| `--selftest-fa [wav] [reference]` | load the Persian model, decode the WAV, report CER against the reference |
+
+Arguments after the ones shown are ignored. Anything else as the first
+argument refuses to start.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `STT_MODEL_DIR` | `/models/tdt` | batch (TDT) model directory. Empty is an empty path, not the default |
+| `STT_STREAM_MODEL_DIR` | `/models/nemotron` | streaming model directory |
+| `STT_FA_MODEL_DIR` | `/models/shenava` | Persian model directory |
+| `STT_FA_DEVICE` | `cpu` | `cpu` or `cuda`, used by `--selftest-fa`. Checked in every mode; anything else (empty included) refuses to start |
+| `STT_MAX_SESSIONS` | `8` | concurrent streaming sessions. Unset or empty gives 8; anything else that is not a positive integer refuses to start |
+| `STT_AUTH_TOKEN` | — | the original credential, reported as client `default` |
+| `STT_TOKEN_<NAME>` | — | one credential per caller, reported as client `<name>` lowercased. Serve needs at least one of these or `STT_AUTH_TOKEN`; empty values do not count |
+| `RUST_LOG` | `info,ort=debug` | tracing filter. Invalid falls back to the default; empty means no directives |
+
+A value under any `STT_*` name or `RUST_LOG` that is not valid UTF-8 refuses to
+start. Error messages name a token's variable, never its value.
+
+Libraries read their own variables, which are not in the table: ONNX Runtime
+and the `ort` crate (`ORT_LOG`, among others), the CUDA runtime
+(`CUDA_VISIBLE_DEVICES` and the `NVIDIA_*` set the device plugin injects), and
+tracing-subscriber's `NO_COLOR`. `fetch-model.sh`, the initContainer, is a
+separate program and reads `TDT_REPO`, `NEMOTRON_REPO` and `SHENAVA_REPO`.
+
 ### Transports
 
 | caller | address | notes |

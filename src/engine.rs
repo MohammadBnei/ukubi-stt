@@ -57,6 +57,10 @@ const _: () = {
 /// the container's PID namespace, so a per-process query returns nothing useful
 /// here. Correct on a single-tenant GPU, which ADR-0011 guarantees this is.
 /// Switch to NVML per-process if this GPU is ever shared.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "nvidia-smi is the GPU check; the child inherits the environment"
+)]
 pub fn gpu_used_mib() -> Result<u64> {
     let out = Command::new("nvidia-smi")
         .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
@@ -291,6 +295,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods, reason = "a scratch file in the temp dir")]
     fn wav_reader_rejects_the_wrong_sample_rate() {
         // The model is 16kHz mono. Accepting 44.1k silently would produce a
         // plausible-looking but wrong transcript, and a wrong RTF with it.

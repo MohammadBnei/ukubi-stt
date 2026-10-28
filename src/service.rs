@@ -35,41 +35,6 @@ pub struct ClientName(pub String);
 /// no Cloudflare WAF in front of it, so the body cap is ours to set.
 pub const MAX_DECODE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Default cap on concurrent streaming sessions, overridable with
-/// `STT_MAX_SESSIONS`.
-///
-/// The binding constraint is not the ~7.5MB of decoder state each one holds —
-/// it is the GPU, which each stream occupies for 20-50ms out of every 560ms.
-/// Eight is roughly half the card's duty cycle with the batch path still
-/// needing room, but that is an estimate, and the right number is whatever the
-/// card sustains once real consumers are on it. Configurable so tuning it is a
-/// values edit rather than a rebuild.
-const DEFAULT_MAX_SESSIONS: usize = 8;
-
-/// Split from the env read so the branching is testable without mutating
-/// process-global state, which two tests running in parallel would race on.
-fn parse_max_sessions(raw: Option<&str>) -> usize {
-    match raw {
-        None | Some("") => DEFAULT_MAX_SESSIONS,
-        Some(raw) => match raw.parse::<usize>() {
-            // Zero would silently disable streaming entirely — a very confusing
-            // way to discover a typo, so it falls back rather than being obeyed.
-            Ok(n) if n > 0 => n,
-            _ => {
-                tracing::warn!(
-                    "STT_MAX_SESSIONS={raw:?} is not a positive integer; \
-                     using the default of {DEFAULT_MAX_SESSIONS}"
-                );
-                DEFAULT_MAX_SESSIONS
-            }
-        },
-    }
-}
-
-fn max_sessions() -> usize {
-    parse_max_sessions(std::env::var("STT_MAX_SESSIONS").ok().as_deref())
-}
-
 /// Sessions idle longer than this are swept. Browsers close tabs without
 /// sending `last: true`, and that is the normal case rather than the edge — an
 /// unbounded map keyed by a client-supplied string is a memory leak with an
@@ -269,8 +234,12 @@ pub struct SttService {
 }
 
 impl SttService {
-    pub fn new(model: ParakeetTDT, stream_dir: PathBuf, fa_dir: PathBuf) -> Self {
-        let max_sessions = max_sessions();
+    pub fn new(
+        model: ParakeetTDT,
+        stream_dir: PathBuf,
+        fa_dir: PathBuf,
+        max_sessions: usize,
+    ) -> Self {
         tracing::info!(max_sessions, "streaming session cap");
         Self {
             model: Arc::new(Mutex::new(model)),
@@ -671,10 +640,11 @@ impl pb::stt_server::Stt for SttService {
 /// caller can interleave audio into another's `session_id` — they all hold the
 /// same credential, so the id is the only thing separating them.
 ///
-/// Credentials are read from the environment as `STT_TOKEN_<NAME>`, one per
-/// caller, plus the original `STT_AUTH_TOKEN` as `default` so nothing that
-/// works today stops working. Adding a caller is a new Infisical secret;
-/// revoking one is deleting it. Both are one action affecting one caller.
+/// Credentials come from the environment (see `config.rs`) as
+/// `STT_TOKEN_<NAME>`, one per caller, plus the original `STT_AUTH_TOKEN` as
+/// `default` so nothing that works today stops working. Adding a caller is a
+/// new Infisical secret; revoking one is deleting it. Both are one action
+/// affecting one caller.
 ///
 /// forwardAuth remains rejected on the ground ADR-0044 gave: authentik's proxy
 /// provider answers an unauthenticated request with a 302 to a login page,
@@ -685,33 +655,14 @@ pub struct BearerAuth {
 }
 
 impl BearerAuth {
-    /// Collect every configured credential. Errors if there are none rather
-    /// than starting an unauthenticated GPU on a hostname that Certificate
-    /// Transparency publishes minutes after issuance.
-    pub fn from_env() -> anyhow::Result<Self> {
-        let mut clients: Vec<(String, Vec<u8>)> = std::env::vars()
-            .filter(|(_, v)| !v.is_empty())
-            .filter_map(|(k, v)| match k.strip_prefix("STT_TOKEN_") {
-                Some(name) => Some((name.to_lowercase(), v.into_bytes())),
-                None if k == "STT_AUTH_TOKEN" => Some(("default".to_string(), v.into_bytes())),
-                None => None,
-            })
-            .collect();
-        clients.sort_by(|a, b| a.0.cmp(&b.0));
-
-        anyhow::ensure!(
-            !clients.is_empty(),
-            "no credentials configured. Set STT_AUTH_TOKEN, or one STT_TOKEN_<NAME> per caller, \
-             via Infisical (project ukubi-stt-bhr-m). Refusing to serve a GPU with no \
-             authentication on a publicly-resolvable hostname."
-        );
-        tracing::info!(
-            clients = ?clients.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-            "bearer credentials loaded"
-        );
-        Ok(Self {
-            clients: Arc::new(clients),
-        })
+    /// `Config::load` has already refused an empty set rather than start an
+    /// unauthenticated GPU on a hostname that Certificate Transparency
+    /// publishes minutes after issuance.
+    pub fn new(credentials: crate::config::Credentials) -> Self {
+        tracing::info!(clients = ?credentials.names(), "bearer credentials loaded");
+        Self {
+            clients: Arc::new(credentials.into_vec()),
+        }
     }
 }
 
@@ -860,19 +811,5 @@ mod tests {
         // Once emitted, the text is passed through untouched — including a chunk
         // that is nothing but the separator between two words.
         assert_eq!(drop_leading_separator(" ", &mut emitted), " ");
-    }
-
-    #[test]
-    fn max_sessions_falls_back_rather_than_obeying_nonsense() {
-        assert_eq!(parse_max_sessions(None), DEFAULT_MAX_SESSIONS);
-        assert_eq!(parse_max_sessions(Some("")), DEFAULT_MAX_SESSIONS);
-        assert_eq!(parse_max_sessions(Some("12")), 12);
-
-        // A zero cap would disable streaming entirely and report it as
-        // RESOURCE_EXHAUSTED on the first chunk — indistinguishable from a busy
-        // GPU, which is exactly the wrong way to learn about a typo.
-        assert_eq!(parse_max_sessions(Some("0")), DEFAULT_MAX_SESSIONS);
-        assert_eq!(parse_max_sessions(Some("-3")), DEFAULT_MAX_SESSIONS);
-        assert_eq!(parse_max_sessions(Some("lots")), DEFAULT_MAX_SESSIONS);
     }
 }

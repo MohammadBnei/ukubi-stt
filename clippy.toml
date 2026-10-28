@@ -1,0 +1,35 @@
+# The environment is read in exactly one place: config::Config::from_process.
+# Every other reader is refused here, so `cargo clippy -- -D warnings` (CI)
+# fails on one. Clippy resolves each call to its definition, so a renamed or
+# grouped import is caught the same as a full path. Exemptions are #[expect] /
+# #[allow] at fixed sites, and config.rs's lint_escapes_are_only_at_the_approved_sites
+# test holds them to that list.
+#
+# A path here that does not resolve is only a warning, not an error, so a typo
+# silently unbans it: check clippy's output for "does not refer to a reachable".
+disallowed-methods = [
+    { path = "std::env::var", reason = "read config through config::Config" },
+    { path = "std::env::var_os", reason = "read config through config::Config" },
+    { path = "std::env::vars", reason = "read config through config::Config" },
+    { path = "std::env::vars_os", reason = "read config through config::Config" },
+    { path = "std::env::args", reason = "read config through config::Config" },
+    { path = "std::env::args_os", reason = "read config through config::Config" },
+    { path = "std::env::temp_dir", reason = "read config through config::Config" },
+    { path = "std::env::home_dir", reason = "read config through config::Config" },
+    { path = "std::env::current_dir", reason = "read config through config::Config" },
+    { path = "std::env::current_exe", reason = "read config through config::Config" },
+    { path = "std::env::set_var", reason = "read config through config::Config" },
+    { path = "std::env::remove_var", reason = "read config through config::Config" },
+    { path = "tracing_subscriber::EnvFilter::from_default_env", reason = "read config through config::Config" },
+    { path = "tracing_subscriber::EnvFilter::try_from_default_env", reason = "read config through config::Config" },
+    { path = "tracing_subscriber::EnvFilter::from_env", reason = "read config through config::Config" },
+    { path = "tracing_subscriber::EnvFilter::try_from_env", reason = "read config through config::Config" },
+    { path = "tracing_subscriber::filter::Builder::from_env", reason = "read config through config::Config" },
+    { path = "tracing_subscriber::filter::Builder::try_from_env", reason = "read config through config::Config" },
+    { path = "tracing_subscriber::filter::Builder::from_env_lossy", reason = "read config through config::Config" },
+    { path = "tracing_subscriber::fmt::init", reason = "read config through config::Config" },
+    { path = "tracing_subscriber::fmt::try_init", reason = "read config through config::Config" },
+    # A child process inherits the whole environment, tokens included, and
+    # PATH decides which binary runs.
+    { path = "std::process::Command::new", reason = "spawning a process hands it every credential" },
+]

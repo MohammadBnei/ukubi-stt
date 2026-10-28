@@ -36,8 +36,10 @@ on:
       - '*'
 
 # Two pushes must not compute the same version from the same latest tag and lose one.
+# A pull request gets a group of its own: in the shared one, every push to main
+# cancelled whichever PR's checks were running, and the reverse.
 concurrency:
-  group: release
+  group: release-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
   cancel-in-progress: true
 
 env:

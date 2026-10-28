@@ -459,7 +459,7 @@ against 8GB before Phase E.
 
 ## CI
 
-One pipeline, `image.yml`, on every PR and every push to `main`:
+One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below):
 
 | job | runs on | when | proves |
 |---|---|---|---|
@@ -469,8 +469,10 @@ One pipeline, `image.yml`, on every PR and every push to `main`:
 | `deploy` | GitHub-hosted | pushes | bumps `image.tag` in `helm/values.yaml` |
 
 A push to `main` that touches only `*.md`, `helm/**` or `package.json` runs
-nothing. A `Cargo.toml`/`Cargo.lock`-only push does run, so a dependency bump
-ships. Nothing after `checks` runs if it is red. The checks cannot prove CUDA
+nothing. A `Cargo.toml`/`Cargo.lock`-only push does run the checks, but it
+ships only if its commit is releasable: commit a security bump as `fix(deps):`.
+A `chore(deps):` or `build(deps):` bump cuts no release, so `build-push`
+rebuilds the previous tag without it. Nothing after `checks` runs if it is red. The checks cannot prove CUDA
 engages — no hosted runner has an RTX 2070, which is the whole reason Gate 0
 runs on real hardware.
 

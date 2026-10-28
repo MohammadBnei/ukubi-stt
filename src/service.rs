@@ -642,8 +642,9 @@ impl pb::stt_server::Stt for SttService {
 ///
 /// Credentials come from the environment (see `config.rs`) as
 /// `STT_TOKEN_<NAME>`, one per caller, plus the original `STT_AUTH_TOKEN` as
-/// `default` so nothing that works today stops working. Adding a caller is a new Infisical secret;
-/// revoking one is deleting it. Both are one action affecting one caller.
+/// `default` so nothing that works today stops working. Adding a caller is a
+/// new Infisical secret; revoking one is deleting it. Both are one action
+/// affecting one caller.
 ///
 /// forwardAuth remains rejected on the ground ADR-0044 gave: authentik's proxy
 /// provider answers an unauthenticated request with a 302 to a login page,
@@ -660,7 +661,7 @@ impl BearerAuth {
     pub fn new(credentials: crate::config::Credentials) -> Self {
         tracing::info!(clients = ?credentials.names(), "bearer credentials loaded");
         Self {
-            clients: Arc::new(credentials.0),
+            clients: Arc::new(credentials.into_vec()),
         }
     }
 }

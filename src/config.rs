@@ -57,13 +57,19 @@ pub enum Mode {
     },
 }
 
-/// `(name, token)` per caller, sorted by name. `Debug` prints names only, so
-/// deriving `Debug` on anything that holds one cannot leak a token.
-pub struct Credentials(pub Vec<(String, Vec<u8>)>);
+/// `(name, token)` per caller, sorted by name, names unique and non-empty.
+/// `Debug` prints names only, so deriving `Debug` on anything that holds one
+/// cannot leak a token. The field is private: only `Config::load` builds one,
+/// so a `Credentials` is never empty.
+pub struct Credentials(Vec<(String, Vec<u8>)>);
 
 impl Credentials {
     pub fn names(&self) -> Vec<&str> {
         self.0.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    pub fn into_vec(self) -> Vec<(String, Vec<u8>)> {
+        self.0
     }
 }
 
@@ -79,12 +85,12 @@ impl Config {
         reason = "the one reader of the real process"
     )]
     pub fn from_process() -> anyhow::Result<Self> {
-        Self::load(std::env::args().skip(1), std::env::vars_os())
+        Self::load(std::env::args_os().skip(1), std::env::vars_os())
     }
 
     /// `args` excludes the program name.
     pub fn load(
-        args: impl IntoIterator<Item = String>,
+        args: impl IntoIterator<Item = OsString>,
         env: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> anyhow::Result<Self> {
         load_recorded(args, env).0
@@ -117,7 +123,7 @@ impl Env {
         let mut vars = Vec::new();
         for (k, v) in raw {
             match (k.into_string(), v.into_string()) {
-                (Ok(k), Ok(v)) => vars.push((k, v)),
+                (Ok(k), Ok(v)) if Self::owned(&k) => vars.push((k, v)),
                 // Names the key, never the value: it may be a token.
                 (Ok(k), Err(_)) if Self::owned(&k) => {
                     errors.push(format!("{k} is not valid UTF-8"))
@@ -171,14 +177,19 @@ fn parse_max_sessions(raw: Option<&str>) -> Result<usize, String> {
 }
 
 fn load_recorded(
-    args: impl IntoIterator<Item = String>,
+    args: impl IntoIterator<Item = OsString>,
     env: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> (anyhow::Result<Config>, Reads) {
     let mut errors = Vec::new();
     let mut env = Env::new(env, &mut errors);
 
-    // Trailing extra arguments are ignored, as they always have been.
-    let mut args = args.into_iter();
+    // Trailing extra arguments are ignored, as they always have been. A
+    // non-UTF-8 one is refused rather than panicking, as args() would.
+    let mut args = args.into_iter().filter_map(|a| {
+        a.into_string()
+            .map_err(|a| errors.push(format!("the argument {a:?} is not valid UTF-8")))
+            .ok()
+    });
     let first = args.next();
     let mut flags = BTreeSet::new();
     let mut is = |flag: &'static str| {
@@ -251,6 +262,21 @@ fn load_recorded(
         .map(|(n, v)| (n, v.into_bytes()))
         .collect();
     clients.sort_by(|a, b| a.0.cmp(&b.0));
+    // The name is what keeps one caller out of another's session_id, so two
+    // credentials under one name (case, or STT_TOKEN_DEFAULT beside
+    // STT_AUTH_TOKEN) refuse. Names the client, never the token.
+    if clients.iter().any(|(n, _)| n.is_empty()) {
+        errors.push("STT_TOKEN_ has no client name: use STT_TOKEN_<NAME>".to_string());
+    }
+    for pair in clients.windows(2) {
+        if pair[0].0 == pair[1].0 && !pair[0].0.is_empty() {
+            errors.push(format!(
+                "two credentials for the client {:?}: names are case-insensitive, \
+                 and STT_AUTH_TOKEN is \"default\"",
+                pair[0].0
+            ));
+        }
+    }
 
     let mode = want.map(|w| match w {
         Want::Serve => {
@@ -297,7 +323,7 @@ mod tests {
     }
 
     fn load(args: &[&str], pairs: &[(&str, &str)]) -> anyhow::Result<Config> {
-        Config::load(args.iter().map(|s| s.to_string()), env(pairs))
+        Config::load(args.iter().map(OsString::from), env(pairs))
     }
 
     fn err(args: &[&str], pairs: &[(&str, &str)]) -> Vec<String> {
@@ -438,6 +464,29 @@ mod tests {
     }
 
     #[test]
+    fn clashing_or_empty_client_names_refuse() {
+        let clash = "two credentials for the client \"default\": names are case-insensitive, \
+                     and STT_AUTH_TOKEN is \"default\"";
+        assert_eq!(err(&[], &[T, ("STT_TOKEN_DEFAULT", "b")]), [clash]);
+        assert_eq!(
+            err(&[], &[("STT_TOKEN_Fleet", "a"), ("STT_TOKEN_FLEET", "b")]),
+            [clash.replace("default\":", "fleet\":")]
+        );
+        assert_eq!(
+            err(&[], &[T, ("STT_TOKEN_", "b")]),
+            ["STT_TOKEN_ has no client name: use STT_TOKEN_<NAME>"]
+        );
+    }
+
+    #[test]
+    fn non_utf8_argument_refuses() {
+        use std::os::unix::ffi::OsStringExt;
+        let args = vec!["--selftest".into(), OsString::from_vec(vec![0xff])];
+        let e = Config::load(args, env(&[])).unwrap_err().to_string();
+        assert_eq!(e, "the argument \"\\xFF\" is not valid UTF-8");
+    }
+
+    #[test]
     fn max_sessions_refuses_nonsense() {
         assert_eq!(parse_max_sessions(None), Ok(DEFAULT_MAX_SESSIONS));
         assert_eq!(parse_max_sessions(Some("")), Ok(DEFAULT_MAX_SESSIONS));
@@ -547,7 +596,7 @@ mod tests {
     #[test]
     fn readme_tables_match_what_the_loader_reads() {
         // An unknown argument makes the parser compare against every flag.
-        let (_, reads) = load_recorded(vec!["--not-a-flag".to_string()], env(&[]));
+        let (_, reads) = load_recorded(vec!["--not-a-flag".into()], env(&[]));
         assert!(reads.keys.contains("STT_MODEL_DIR"), "positive control");
         assert!(reads.flags.contains("--selftest-fa"), "positive control");
         let (flags, keys) = readme_rows();

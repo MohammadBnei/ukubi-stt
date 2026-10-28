@@ -43,7 +43,7 @@ serde_json = "1"
 # subscriber, so on 2026-08-31 they went nowhere and Gate 0's failure had to be
 # diagnosed by reading ort-sys's build script instead.
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
 tonic = "0.14"

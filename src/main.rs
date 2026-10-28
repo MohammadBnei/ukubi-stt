@@ -22,6 +22,7 @@ mod service;
 use anyhow::{Context, Result};
 use service::pb::stt_server::SttServer;
 use std::{net::SocketAddr, path::PathBuf};
+use tracing_subscriber::{fmt::writer::BoxMakeWriter, util::SubscriberInitExt};
 
 const GRPC_ADDR: &str = "0.0.0.0:9090";
 const HEALTH_ADDR: &str = "0.0.0.0:8080";
@@ -34,17 +35,39 @@ fn main() -> Result<()> {
     // a CUDA failure is indistinguishable from a CUDA success that used no
     // memory — which is exactly how 2026-08-31 was spent. Verbose by
     // construction; RUST_LOG still overrides, and an invalid one falls back.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            config
-                .log_filter
-                .as_deref()
-                .and_then(|s| tracing_subscriber::EnvFilter::try_new(s).ok())
-                .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info,ort=debug")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Serve logs JSON lines on stdout. A selftest's stdout is its report, so its
+    // logs go to stderr (still JSON).
+    const DEFAULT_FILTER: &str = "info,ort=debug";
+    let (filter, bad_filter) = match config
+        .log_filter
+        .as_deref()
+        .map(tracing_subscriber::EnvFilter::try_new)
+    {
+        Some(Ok(f)) => (f, None),
+        Some(Err(e)) => (tracing_subscriber::EnvFilter::new(DEFAULT_FILTER), Some(e)),
+        None => (tracing_subscriber::EnvFilter::new(DEFAULT_FILTER), None),
+    };
+    let writer = if logs_to_stdout(&config.mode) {
+        BoxMakeWriter::new(std::io::stdout)
+    } else {
+        BoxMakeWriter::new(std::io::stderr)
+    };
+    // init(), not set_global_default: it also installs the `log` bridge.
+    logs(filter, writer).init();
+    if let Some(e) = bad_filter {
+        tracing::warn!("RUST_LOG is invalid, using {DEFAULT_FILTER}: {e}");
+    }
 
+    // A fatal error is the line that explains a crash loop, so it is a JSON
+    // ERROR like every other line, not anyhow's plain text on stderr.
+    if let Err(e) = run(config) {
+        tracing::error!("{e:#}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run(config: config::Config) -> Result<()> {
     let config::Config {
         mode,
         model_dir,
@@ -237,6 +260,34 @@ fn selftest(model_dir: &std::path::Path, audio: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Serve logs on stdout. A selftest's stdout is its report, so its logs go to
+/// stderr. Exhaustive so a new mode has to choose.
+fn logs_to_stdout(mode: &config::Mode) -> bool {
+    match mode {
+        config::Mode::Serve { .. } => true,
+        config::Mode::Selftest { .. }
+        | config::Mode::SelftestStream
+        | config::Mode::SelftestFa { .. } => false,
+    }
+}
+
+/// One JSON object per line: `timestamp`, `level`, `message` and the event's
+/// fields at the top level, then `target` and the current span. Loki reads
+/// `level` as detected_level, which is what log-error-rate-spike counts.
+fn logs(
+    filter: tracing_subscriber::EnvFilter,
+    writer: BoxMakeWriter,
+) -> impl tracing::Subscriber + Send + Sync {
+    // ponytail: one span level (decode_chunk), so `span` alone; the list repeats it.
+    tracing_subscriber::fmt()
+        .json()
+        .flatten_event(true)
+        .with_span_list(false)
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .finish()
+}
+
 /// Blocking `main` on purpose: the model loads and CUDA is asserted *before*
 /// any listener exists. There is no window in which this process is reachable
 /// but cannot decode.
@@ -364,6 +415,91 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// README: "Serve writes them to stdout; the `--selftest*` modes write them
+    /// to stderr" — a selftest's stdout is its report.
+    #[test]
+    fn only_serve_logs_to_stdout() {
+        for (args, stdout) in [
+            (&[][..], true),
+            (&["--selftest"], false),
+            (&["--selftest-stream"], false),
+            (&["--selftest-fa"], false),
+        ] {
+            let mode = crate::config::Config::load(
+                args.iter().map(Into::into),
+                [("STT_AUTH_TOKEN".into(), "x".into())],
+            )
+            .unwrap()
+            .mode;
+            assert_eq!(super::logs_to_stdout(&mode), stdout, "{args:?}");
+        }
+    }
+
+    /// The format Loki parses, through the real log sites: one JSON object per
+    /// line with its level, the message words unchanged, fields at the top level
+    /// and the session span kept on an ERROR raised inside it.
+    #[test]
+    fn logs_are_json_lines_with_their_level() {
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let subscriber = super::logs(
+            tracing_subscriber::EnvFilter::new("info"),
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(move || sink.clone()),
+        );
+        let credentials =
+            match crate::config::Config::load([], [("STT_AUTH_TOKEN".into(), "x".into())])
+                .unwrap()
+                .mode
+            {
+                crate::config::Mode::Serve { credentials } => credentials,
+                other => panic!("{other:?}"),
+            };
+        tracing::subscriber::with_default(subscriber, || {
+            // Callsite interest is cached process-wide. A parallel test that hit
+            // the same WARN with no subscriber cached "never"; recompute it now
+            // that this one is registered.
+            tracing::callsite::rebuild_interest_cache();
+            tracing::info_span!("decode_chunk", session = "s1")
+                .in_scope(|| crate::errkeys::internal("what", &"boom"));
+            // A name no other test uses: warn_due is process-global.
+            crate::errkeys::model_unavailable("log format test model", &"gone");
+            crate::service::BearerAuth::new(credentials);
+            tracing::debug!("filtered out");
+        });
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
+            .collect();
+        for l in &lines {
+            assert!(l["timestamp"].is_string(), "{l}");
+        }
+        let levels: Vec<_> = lines.iter().map(|l| l["level"].as_str().unwrap()).collect();
+        // Exactly three: the DEBUG line is gone, so the filter passed in is applied.
+        assert_eq!(levels, ["ERROR", "WARN", "INFO"], "{text}");
+        assert_eq!(lines[0]["message"], "what: boom");
+        assert_eq!(lines[0]["span"]["session"], "s1");
+        assert!(lines[0].get("spans").is_none(), "{text}");
+        assert_eq!(
+            lines[1]["message"],
+            "log format test model failed to load: gone"
+        );
+        assert_eq!(lines[2]["message"], "bearer credentials loaded");
+        assert_eq!(lines[2]["clients"], r#"["default"]"#);
     }
 
     /// Not a test on its own: the body of the child process that

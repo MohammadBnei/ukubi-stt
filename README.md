@@ -200,8 +200,9 @@ Add `STT_TOKEN_<YOURAPP>` to Infisical `ukubi-stt-bhr-m` (env `dev`). The
 service scans its whole environment for `STT_TOKEN_*` at startup, so adding a
 caller is adding a secret — no redeploy, no code change — and revoking one
 caller does not revoke the others. The matched name is logged with every
-request as `client=`, which is the only reason a leak can be attributed to one
-consumer rather than all of them.
+request as the `client` field of the `recognize` log line (in Loki,
+`| json | client="<name>"`), which is the only reason a leak can be attributed
+to one consumer rather than all of them.
 
 **Then copy the value into your own Infisical project.** This is deliberate and
 it is *not* what a first instinct suggests. Granting your app's identity read on
@@ -435,6 +436,11 @@ argument refuses to start.
 
 A value under any `STT_*` name or `RUST_LOG` that is not valid UTF-8 refuses to
 start. Error messages name a token's variable, never its value.
+
+Logs are JSON, one object per line: `timestamp`, `level`, `message` and the
+event's fields, then `target` and the current span (tracing-subscriber's
+keys). Serve writes them to stdout; the `--selftest*` modes write them to
+stderr, because their stdout is the report.
 
 Libraries read their own variables, which are not in the table: ONNX Runtime
 and the `ort` crate (`ORT_LOG`, among others), the CUDA runtime

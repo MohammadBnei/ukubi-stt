@@ -698,6 +698,23 @@ mod tests {
         );
     }
 
+    /// Log words are an interface: log-error-rate-spike counts ERROR lines. A new
+    /// or removed ERROR site fails here until someone decides it should page:
+    /// the macro, errkeys::internal (which logs one), and the Level spelling.
+    #[test]
+    fn the_error_sites_are_known() {
+        assert_eq!(
+            count_in_sources(concat!("tracing::", "error!")),
+            counts(&[("src/errkeys.rs", 1), ("src/main.rs", 2)])
+        );
+        assert_eq!(
+            count_in_sources(concat!("errkeys::", "internal(")),
+            // main.rs: the log format test.
+            counts(&[("src/main.rs", 1), ("src/service.rs", 8)])
+        );
+        assert_eq!(count_in_sources(concat!("Level::", "ERROR")), counts(&[]));
+    }
+
     /// The goal itself, without clippy: no file outside the exempt sites names
     /// `std::env` or spawns a process. A token count, so it also catches a
     /// reader clippy would only see under `-D warnings` in CI. config.rs's

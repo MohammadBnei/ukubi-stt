@@ -42,11 +42,10 @@ fn main() -> Result<()> {
         .as_deref()
         .and_then(|s| tracing_subscriber::EnvFilter::try_new(s).ok())
         .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info,ort=debug"));
-    let writer = match config.mode {
-        config::Mode::Serve { .. } => BoxMakeWriter::new(std::io::stdout),
-        config::Mode::Selftest { .. }
-        | config::Mode::SelftestStream
-        | config::Mode::SelftestFa { .. } => BoxMakeWriter::new(std::io::stderr),
+    let writer = if logs_to_stdout(&config.mode) {
+        BoxMakeWriter::new(std::io::stdout)
+    } else {
+        BoxMakeWriter::new(std::io::stderr)
     };
     // init(), not set_global_default: it also installs the `log` bridge.
     logs(filter, writer).init();
@@ -243,6 +242,17 @@ fn selftest(model_dir: &std::path::Path, audio: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Serve logs on stdout. A selftest's stdout is its report, so its logs go to
+/// stderr. Exhaustive so a new mode has to choose.
+fn logs_to_stdout(mode: &config::Mode) -> bool {
+    match mode {
+        config::Mode::Serve { .. } => true,
+        config::Mode::Selftest { .. }
+        | config::Mode::SelftestStream
+        | config::Mode::SelftestFa { .. } => false,
+    }
+}
+
 /// One JSON object per line: `timestamp`, `level`, `message` and the event's
 /// fields at the top level, then `target` and the enclosing spans. Loki reads
 /// `level` as detected_level, which is what log-error-rate-spike counts.
@@ -403,6 +413,26 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// README: "Serve writes them to stdout; the `--selftest*` modes write them
+    /// to stderr" — a selftest's stdout is its report.
+    #[test]
+    fn only_serve_logs_to_stdout() {
+        for (args, stdout) in [
+            (&[][..], true),
+            (&["--selftest"], false),
+            (&["--selftest-stream"], false),
+            (&["--selftest-fa"], false),
+        ] {
+            let mode = crate::config::Config::load(
+                args.iter().map(Into::into),
+                [("STT_AUTH_TOKEN".into(), "x".into())],
+            )
+            .unwrap()
+            .mode;
+            assert_eq!(super::logs_to_stdout(&mode), stdout, "{args:?}");
         }
     }
 

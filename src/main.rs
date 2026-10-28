@@ -310,6 +310,9 @@ fn serve(model_dir: &std::path::Path, stream_dir: PathBuf, fa_dir: PathBuf) -> R
             // Recreate is mandatory for this Deployment (the new pod would
             // request the only nvidia.com/gpu while the old one holds it),
             // so a clean SIGTERM shutdown is what keeps the gap short.
+            // ponytail: the drain is unbounded. Idle connections and unary
+            // RPCs finish at once; a live bidi stream holds it open until
+            // the client stops or SIGKILL lands. Add a timeout if that bites.
             .serve_with_shutdown(grpc, shutdown)
             .await
             .map_err(anyhow::Error::from)

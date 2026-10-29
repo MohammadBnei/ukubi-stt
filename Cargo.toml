@@ -1,6 +1,8 @@
 [package]
 name = "ukubi-stt"
-version = "0.10.2"
+# Not the release version: that is the git tag, passed to the image build as the
+# VERSION build-arg (ukubi-ci release). 0.0.0, so no stale number poses as one.
+version = "0.0.0"
 edition = "2021"
 description = "GPU speech-to-text for ukubi-cluster (ADR-0044)"
 license = "MIT"

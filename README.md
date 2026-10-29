@@ -55,31 +55,37 @@ ParakeetTDT::from_pretrained(dir, Some(cfg))?
 
 ## Releasing
 
-Same `release-it` flow as the other build repos (`editable-blog`,
-`agent-fleet`, `wedding-2026`) — conventional-changelog, angular preset,
-`CHANGELOG.md` written in the release commit:
+`image.yml`'s `release` job calls ukubi-ci's `release.yml` (git-cliff, from
+Conventional Commits). On every releasable push to `main` it computes the next
+semver since the last `X.Y.Z` tag, prepends that section to `CHANGELOG.md`,
+commits `chore(release): X.Y.Z` (CHANGELOG.md only) and pushes it with an
+annotated bare `X.Y.Z` tag, the same no-`v` form as the earlier release-it
+tags. On a PR it is a dry run: the would-be version and section go to the
+job's step summary. Nothing is run locally.
 
-```bash
-bun install     # or npm i
-bun run release
-```
+The commit type is the release: `feat` bumps the minor, everything else not
+skipped at least the patch, and a breaking change bumps the minor while the
+version is `0.x`. `chore(release)`, `chore(deploy)` and merge commits are
+skipped. `CHANGELOG.md` lists features, fixes and performance in their own
+groups and every other commit under "Other".
 
-**`package.json` holds the canonical version and an `after:bump` hook rewrites
-`Cargo.toml` to match.** Two files, one source of truth, because `image.yml`
-reads the image tag out of `Cargo.toml`.
+The version is not in any file. `build-push` checks out the release tag,
+tags the image with the commit's 12-character SHA, and passes the version as
+the `VERSION` build-arg: it becomes the `org.opencontainers.image.version`
+label, the `version` field of the `ukubi-stt starting` line every mode logs
+first, and what `ukubi-stt --version` prints. A build that is not a release
+reports `X.Y.Z+<sha>` on `main` or `X.Y.Z-dev+<sha>` elsewhere; a plain `cargo
+build` reports `dev`. `deploy` then pins that SHA as `image.tag` in
+`helm/values.yaml` for ArgoCD. To release or rebuild the tip by hand:
+`gh workflow run image.yml --ref main`. With nothing to release the tip is
+usually the `chore(deploy)` bump, so this builds and deploys it as a new
+`X.Y.Z+<sha>` image, not the tagged one.
 
-`tagName` is the bare `${version}`, not release-it's default `v${version}`: the
-build job checks out that tag by the same string it reads from `Cargo.toml`.
-
-`image.yml` runs this itself on every releasable push to `main`, then builds and
-pushes the image from the new tag, then its deploy job bumps `image.tag` in
-`helm/values.yaml` for ArgoCD to pick up. A local `bun run release` is no
-longer the normal path.
-
-**Known broken (2026-10-28):** the release job fails in the `after:bump` hook:
-`cargo update -p ukubi-stt --offline` finds no crates in the runner's cold
-cargo cache ("no matching package named `anyhow`"). Until that hook is fixed,
-pushes to `main` cut no release and build nothing.
+A `*.md`, `helm/**` or `k8s/**` push starts no run (see CI), and ukubi-ci's
+release treats it as newer work it must not release over: if one lands while
+a run for an earlier push reaches its release job, that run releases
+nothing and ships as `X.Y.Z+<sha>`. Its commits go out with the next
+releasable push, or now with the dispatch above.
 
 ## Running the gate
 
@@ -94,7 +100,8 @@ service. Run them in a one-shot pod instead.
 - **Persian** (`--selftest-fa`): `k8s/gate-fa-pod.yaml` runs it as is. It needs
   no GPU and no outage.
 - **CUDA** (`--selftest`, `--selftest-stream`): no manifest ships for it. Adapt
-  `gate-fa-pod.yaml`: a current image tag, the command below, and BOTH
+  `gate-fa-pod.yaml`: the current image tag (the SHA in `helm/values.yaml`'s
+  `image.tag`), the command below, and BOTH
   `runtimeClassName: nvidia` and an `nvidia.com/gpu: 1` limit. Neither implies
   the other (ADR-0043 Decision 3): without the RuntimeClass no driver is
   injected, so `nvidia-smi` is missing and the gate reads 0 MiB; without the
@@ -429,7 +436,9 @@ inherits the environment; `OUT_DIR` in `build.rs`; test-only code; and
 `src/errkeys.rs`, the one place a `tonic::Status` is built, which the same lint
 enforces). The ban does
 not see `libc::getenv`, `/proc/self/environ` or compile-time `env!`. A test also
-holds these two tables to what the loader actually reads.
+holds these two tables to what the loader actually reads. `VERSION` is not in
+them: it is a build-time input (the Dockerfile's build-arg, read by
+`option_env!`), not a runtime variable.
 
 | Argument | Mode |
 |---|---|
@@ -437,6 +446,7 @@ holds these two tables to what the loader actually reads.
 | `--selftest [wav]` | load the batch model, assert CUDA, transcribe the WAV or a synthetic sweep |
 | `--selftest-stream` | load both models and report total GPU use |
 | `--selftest-fa [wav] [reference]` | load the Persian model, decode the WAV, report CER against the reference |
+| `--version` | print the release version on stdout and exit; needs no credential, but still validates the environment and logs the start line on stderr |
 
 Arguments after the ones shown are ignored. Anything else as the first
 argument refuses to start.
@@ -562,16 +572,16 @@ One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below);
 | `checks` (`ci.yml`) | GitHub-hosted | PRs and pushes | fmt, clippy, tests, web page parses, `cargo audit`, `buf lint`; `buf breaking` against `main` on PRs only |
 | `image-check` | GitHub-hosted (buildah, no push) | PRs | the Dockerfile builds |
 | `trailers` (`trailers.yml`) | GitHub-hosted | PRs | Conventional titles/commits, trailer pair |
-| `release` | GitHub-hosted | pushes | release-it cuts the version, CHANGELOG and tag |
-| `build-push` | build-runner LXC (`[self-hosted, ukubi-build]`) | pushes | that it builds into a CUDA image and pushes |
-| `deploy` | GitHub-hosted | pushes | bumps `image.tag` in `helm/values.yaml` |
+| `release` (ukubi-ci `release.yml`) | GitHub-hosted | PRs (dry run) and pushes | git-cliff cuts the version, CHANGELOG and tag |
+| `build-push` | build-runner LXC (`[self-hosted, ukubi-build]`) | pushes and dispatches | that it builds into a CUDA image; on `main` it pushes it under the commit SHA |
+| `deploy` | GitHub-hosted | pushes and dispatches on `main` | bumps `image.tag` in `helm/values.yaml` |
 
 A push to `main` that touches only `*.md`, `helm/**`, `k8s/**` (one-shot
-manifests, never in the image) or `package.json` runs nothing. Any other push, a `Cargo.toml`/`Cargo.lock`-only bump included, runs
-the whole pipeline and ships: the angular preset bumps at least a patch for
-every commit type, so even a `chore(deps):` bump cuts a release. Only `feat`,
-`fix`, `perf` and `revert` commits are listed in `CHANGELOG.md`, so commit a
-security bump as `fix(deps):` to have it show there. Nothing after `checks`
+manifests, never in the image) runs nothing. Any other push, a `Cargo.toml`/`Cargo.lock`-only bump included, runs
+the whole pipeline and ships: git-cliff bumps at least a patch for every commit
+type it does not skip, so even a `chore(deps):` bump cuts a release (listed
+under "Other"; commit a security bump as `fix(deps):` to list it under
+Fixes). Nothing after `checks`
 runs if it is red. The checks cannot prove CUDA engages — no hosted runner has
 an RTX 2070, which is the whole reason Gate 0 runs on real hardware.
 
@@ -580,17 +590,20 @@ with its reason and fixed version; today that is two build-time-only crates.
 Warnings (unmaintained, unsound) do not fail it.
 
 `buf breaking` is skipped when a commit in the PR declares `BREAKING CHANGE:`,
-which release-it also reads as a major bump.
+which git-cliff also reads as a breaking bump (the minor while on `0.x`).
 
-**Toolchain.** `rust-toolchain.toml` pins the compiler for CI, the release job,
-the Dockerfile and local builds. Run `rustup toolchain install` once in the repo
+**Toolchain.** `rust-toolchain.toml` pins the compiler for CI, the Dockerfile
+and local builds. Run `rustup toolchain install` once in the repo
 (rustup's auto-install of it is deprecated). To bump, edit that file — nothing
 else names the version.
 
-**Rollback** is redeploying an earlier tag — and this repo's retention is
-tighter than the cluster default: zot keeps the last **2** tags plus `latest`
-for `ukubi-stt` (3 everywhere else), because the image is a ~5GB CUDA tree.
-Anything older is GC'd from Garage and must be rebuilt.
+**Rollback** is setting `image.tag` back to an earlier commit's SHA tag — and
+this repo's retention is tighter than the cluster default: zot keeps `latest`
+and the **2** most recently pushed `ukubi-stt` tags (3 everywhere else),
+because the image is a ~5GB CUDA tree. `latest` is re-pushed with every build
+and may take one of those 2 slots, so count on the current SHA and at most one
+earlier (unverified against the registry). Anything older is GC'd from Garage
+and must be rebuilt.
 
 ## Local build
 

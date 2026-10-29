@@ -1,5 +1,5 @@
-# The one place the Rust version is named. ci.yml (`rustup toolchain install`),
-# the release job and the Dockerfile all install what this file says, so a bump is
+# The one place the Rust version is named. ci.yml (`rustup toolchain install`)
+# and the Dockerfile both install what this file says, so a bump is
 # this one edit. 1.99.1 is what floating stable resolved to in CI on 2026-10-28.
 [toolchain]
 channel = "1.99.1"

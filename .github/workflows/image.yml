@@ -69,6 +69,16 @@ jobs:
   checks:
     uses: ./.github/workflows/ci.yml
 
+  # PRs only: prove the Dockerfile builds (buildah, GitHub-hosted, no push). If the hosted
+  # runner runs out of disk on the CUDA base, add `target: build` to build the builder stage only.
+  image-check:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image-build.yml@e784a69d5fe0b258b1b6899f89d42ee87eb89d5c # v0.2.1
+    with:
+      image: ukubi-stt
+
   # Cuts the version and CHANGELOG. This was a local `bun run release` until now, which is
   # why nothing in CI ever versioned this repo. release-it only pushes a commit and a tag —
   # github.release is false — which contents: write covers, so no PAT is involved.

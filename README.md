@@ -559,6 +559,8 @@ One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below):
 | job | runs on | when | proves |
 |---|---|---|---|
 | `checks` (`ci.yml`) | GitHub-hosted | PRs and pushes | fmt, clippy, tests, web page parses, `cargo audit`, `buf lint`; `buf breaking` against `main` on PRs only |
+| `image-check` | GitHub-hosted (buildah, no push) | PRs | the Dockerfile builds |
+| `trailers` (`trailers.yml`) | GitHub-hosted | PRs | Conventional titles/commits, trailer pair |
 | `release` | GitHub-hosted | pushes | release-it cuts the version, CHANGELOG and tag |
 | `build-push` | build-runner LXC (`[self-hosted, ukubi-build]`) | pushes | that it builds into a CUDA image and pushes |
 | `deploy` | GitHub-hosted | pushes | bumps `image.tag` in `helm/values.yaml` |

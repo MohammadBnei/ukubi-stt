@@ -596,7 +596,8 @@ Anything older is GC'd from Garage and must be rebuilt.
 
 The image cannot be built on a Mac (it needs CUDA), but fmt, clippy, the web
 syntax check, `cargo audit` and buf lint from `CLAUDE.md` run locally (`cargo test` does not
-link on macOS; CI runs it). Image builds run
-on the `build-runner` LXC via the `image` workflow (ADR-0034: one runner
+link on macOS; CI runs it). Release image builds run
+on the `build-runner` LXC via the `image` workflow; PRs only build-check the image on
+a GitHub-hosted runner (`image-check`, no push) (ADR-0034: one runner
 instance per repo, buildah under `sudo`, plain-HTTP push to
 `registry.bnei.lan:5000`).

@@ -88,6 +88,37 @@ persistence:
   mountPath: /models
   accessMode: ReadWriteOnce
 
+# Non-root. Pod-level, so it applies to the init containers too. The image has
+# no USER yet (the Dockerfile half waits for main to deploy, standard §9), so
+# runAsUser here is what makes the process 10001 — runAsNonRoot alone would
+# refuse to start a root image. Nothing in the app writes outside /tmp.
+#
+# NOT verifiable while the cluster is down: the nvidia runtime hook under a
+# non-root uid, a read-only root fs and seccomp RuntimeDefault. If it breaks,
+# the batch model's startup assertion crash-loops the pod (an outage under
+# Recreate); the lazy streaming and Persian models would only fail on first
+# request. Rollback = revert this change by PR — ArgoCD selfHeal undoes any
+# hand edit.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  seccompProfile: {type: RuntimeDefault}
+# Main container only: the chart renders initContainers raw, so each one below
+# carries its own copy of this.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: {drop: [ALL]}
+# The one writable path on a read-only root: keeps `--selftest /tmp/a.wav`
+# (README) working and gives CUDA/ORT a temp dir.
+extraVolumes:
+  - name: tmp
+    emptyDir: {sizeLimit: 256Mi}
+extraVolumeMounts:
+  - name: tmp
+    mountPath: /tmp
+
 # Fetches the weights when the volume is empty, which makes the PVC a cache
 # rather than a dependency: a rebuilt node costs one download, not a broken
 # deployment.
@@ -97,7 +128,37 @@ persistence:
 # interpolated rather than hardcoded; a literal here would silently drift from
 # image.tag on every bump and fetch with a stale script.
 initContainers:
+  # The existing weights were written by root (fetch-model ran as root until
+  # now), and fsGroup does not re-own files on a local-path volume, so 10001
+  # could not fetch a missing file. This re-owns them on every start: the
+  # pod's only root process, holding CAP_CHOWN and nothing else. It also
+  # re-owns anything k8s/gate-fa-pod.yaml (still root) writes. Limit: CHOWN
+  # alone cannot enter a 0700 dir it does not own — fetch-model creates 0755.
+  #
+  # This container means the pod needs PSA `baseline`, not `restricted`. When
+  # ADR-0040 Decision 6 labels this namespace, use baseline — or delete this
+  # container once no root writer of /models is left.
+  - name: chown-models
+    image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+    imagePullPolicy: IfNotPresent
+    command: ["chown", "-R", "10001:10001", "/models"]
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL], add: [CHOWN]}
+    volumeMounts:
+      - name: data
+        mountPath: /models
+    resources:
+      requests: {cpu: 10m, memory: 16Mi}
+      limits: {cpu: 100m, memory: 64Mi}
   - name: fetch-model
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
     image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
     imagePullPolicy: IfNotPresent
     command: ["/usr/local/bin/fetch-model.sh"]

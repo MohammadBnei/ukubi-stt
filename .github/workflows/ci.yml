@@ -44,6 +44,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Check the browser page parses
         run: node scripts/check-web-syntax.mjs
+      # No package.json in this Rust repo, so the pinned Biome comes from npm (scripts/ and web/*.js).
+      - name: Biome lint and format check
+        run: npx --yes @biomejs/biome@2.6.4 ci .
 
   # The proto contract. Codegen stays in build.rs (tonic-prost-build); this only
   # lints the schema and refuses wire breaks against main. Same shape as

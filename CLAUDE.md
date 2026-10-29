@@ -26,6 +26,7 @@ cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 node scripts/check-web-syntax.mjs
+npx @biomejs/biome@2.6.4 ci .          # lint + format check for scripts/ and web/*.js; `check --write .` fixes
 cargo audit
 (cd proto && buf lint)
 ```

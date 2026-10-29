@@ -7,16 +7,17 @@
 // time, the symptom was the entire page doing nothing at all, not the audio path
 // misbehaving. It survived four releases because the only check anyone ran was
 // that `/` returned 200, which it did the whole time.
-import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
-import { execFileSync } from "node:child_process";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 function check(name, src) {
-  const file = join(mkdtempSync(join(tmpdir(), "sttweb-")), "page.mjs");
+  const file = join(mkdtempSync(join(tmpdir(), 'sttweb-')), 'page.mjs');
   writeFileSync(file, src);
   try {
-    execFileSync(process.execPath, ["--check", file], { stdio: "pipe" });
+    execFileSync(process.execPath, ['--check', file], { stdio: 'pipe' });
     console.log(`${name}: syntax OK`);
   } catch (e) {
     console.error(`${name} has a syntax error:\n` + (e.stderr || e).toString());
@@ -24,7 +25,7 @@ function check(name, src) {
   }
 }
 
-const html = readFileSync("web/index.html", "utf8");
+const html = readFileSync('web/index.html', 'utf8');
 const m = html.match(/<script type="module">([\s\S]*?)<\/script>/);
 if (!m) {
   console.error('no <script type="module"> found in web/index.html');
@@ -35,7 +36,7 @@ if (!m) {
 // stripping it would delete the very conflict a redeclaration creates. Verified
 // both ways before trusting this.
 const src = m[1];
-check("web/index.html module", src);
+check('web/index.html module', src);
 // The vendored capture module is served separately at /stt-capture.js and is
 // copied into two consumer repos, so a syntax error here breaks three things.
-check("web/stt-capture.js", readFileSync("web/stt-capture.js", "utf8"));
+check('web/stt-capture.js', readFileSync('web/stt-capture.js', 'utf8'));

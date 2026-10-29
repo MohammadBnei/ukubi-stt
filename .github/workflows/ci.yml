@@ -1,7 +1,7 @@
 # Shift the compile check left. The image build takes ~15 minutes on the
 # build-runner LXC pulling a multi-GB CUDA tree; a syntax error should not cost
 # that. image.yml calls this on PRs and on pushes to main that are not
-# docs/helm/package.json only, on GitHub-hosted runners with no GPU, and nothing
+# docs/helm/k8s only, on GitHub-hosted runners with no GPU, and nothing
 # after it (release, build, deploy) runs if it is red.
 #
 # It cannot prove CUDA engages — that is the startup assertion's job on real
@@ -66,8 +66,9 @@ jobs:
 
       # PRs only: on a push to main, HEAD is main. A called workflow sees the
       # caller's event, so this is image.yml's pull_request. A deliberate break
-      # opts out by declaring `BREAKING CHANGE:` in a commit, which release-it
-      # also reads as a major bump — so the skip is visible in the version too.
+      # opts out by declaring `BREAKING CHANGE:` in a commit, which git-cliff
+      # (ukubi-ci release) also reads as a breaking bump — the minor while on
+      # 0.x — so the skip is visible in the version too.
       - name: buf breaking (against main)
         if: github.event_name == 'pull_request'
         working-directory: proto

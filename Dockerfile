@@ -35,6 +35,9 @@ ARG CUDA_VERSION=13.0.3
 # libcurand.so.10 and libcuda.so.1 — the last injected by the container toolkit,
 # and the only library that correctly comes from outside this image.
 ARG UBUNTU_VERSION=ubuntu24.04
+# The release version, from image.yml's build-arg (ukubi-ci release). Global so
+# both stages default to `dev`; read at compile time by option_env!("VERSION").
+ARG VERSION=dev
 
 # THE BUILDER NEEDS NO CUDA. ADR-0045 Decision 4.
 # It used to be nvidia/cuda:*-cudnn-devel at 8.23GB, on the strength of a
@@ -73,8 +76,7 @@ ENV PATH=/root/.cargo/bin:$PATH
 
 WORKDIR /src
 # The compiler is the one rust-toolchain.toml pins, not build-day stable. Copied
-# alone and before Cargo.toml, which every release rewrites, so this layer
-# survives a version bump.
+# alone and before Cargo.toml, so this layer survives a dependency bump.
 COPY rust-toolchain.toml ./
 RUN rustup toolchain install && rustup show active-toolchain
 # Dependencies first, so a source-only edit does not rebuild the parakeet-rs/ort
@@ -104,6 +106,8 @@ COPY src ./src
 # include_str!("../web/index.html") makes the page a compile-time input, so a
 # page-only edit still rebuilds the binary. That is the intended trade: the
 # alternative is a second artefact to deploy and keep in step with the proto.
+# After the dependency build, so a new VERSION reuses that layer.
+ARG VERSION
 RUN touch src/main.rs build.rs && cargo build --release --locked
 
 # The ORT CUDA provider is NOT part of libonnxruntime.a. It is a separate 79MB
@@ -151,4 +155,8 @@ COPY fetch-model.sh /usr/local/bin/fetch-model.sh
 
 ENV STT_MODEL_DIR=/models/tdt
 EXPOSE 8080 9090
+# Last, so a new version touches only metadata. The CUDA base sets this label
+# too (to its Ubuntu release); ours overrides it.
+ARG VERSION
+LABEL org.opencontainers.image.version=$VERSION
 ENTRYPOINT ["/usr/local/bin/ukubi-stt"]

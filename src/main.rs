@@ -1,10 +1,12 @@
 //! `ukubi-stt` — GPU speech-to-text for ukubi-cluster. ADR-0044.
 //!
-//! Two modes, one binary:
+//! One binary, its modes:
 //!
 //!   ukubi-stt                    serve gRPC on :9090, page + health on :8080
 //!   ukubi-stt --selftest [wav]   load the batch model, assert CUDA, transcribe
 //!   ukubi-stt --selftest-stream  load BOTH models and report total GPU use
+//!   ukubi-stt --selftest-fa      load the Persian model, report CER
+//!   ukubi-stt --version          print the release version (README Configuration)
 //!
 //! `--selftest` is the Gate 0 check kept as a manual tool (ADR-0044 Decision 3).
 //! It is not a build gate and cannot be: the build-runner LXC is pinned to
@@ -29,6 +31,12 @@ use tracing_subscriber::{
 
 const GRPC_ADDR: &str = "0.0.0.0:9090";
 const HEALTH_ADDR: &str = "0.0.0.0:8080";
+/// The release, from the image build's VERSION build-arg (ukubi-ci release);
+/// `dev` for a plain cargo build.
+const VERSION: &str = match option_env!("VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
 
 fn main() -> Result<()> {
     let config = config::Config::from_process()?;
@@ -81,6 +89,7 @@ fn start(config: config::Config, run: impl FnOnce(config::Config, bool) -> Resul
         .with(logs(filter, writer))
         .with(traces.as_ref().map(traces::Tracing::layer))
         .init();
+    tracing::info!(version = VERSION, "ukubi-stt starting");
     if let Some(e) = bad_filter {
         tracing::warn!("RUST_LOG is invalid, using {DEFAULT_FILTER}: {e}");
     }
@@ -127,6 +136,10 @@ fn run(config: config::Config, traced: bool) -> Result<()> {
         config::Mode::SelftestStream => selftest_stream(&model_dir, &stream_dir),
         config::Mode::SelftestFa { wav, reference } => {
             selftest_fa(&fa_dir, fa_device, wav, reference)
+        }
+        config::Mode::Version => {
+            println!("{VERSION}");
+            Ok(())
         }
         config::Mode::Serve { credentials } => serve(
             &model_dir,
@@ -317,7 +330,8 @@ fn logs_to_stdout(mode: &config::Mode) -> bool {
         config::Mode::Serve { .. } => true,
         config::Mode::Selftest { .. }
         | config::Mode::SelftestStream
-        | config::Mode::SelftestFa { .. } => false,
+        | config::Mode::SelftestFa { .. }
+        | config::Mode::Version => false,
     }
 }
 
@@ -536,6 +550,7 @@ mod tests {
             (&["--selftest"], false),
             (&["--selftest-stream"], false),
             (&["--selftest-fa"], false),
+            (&["--version"], false),
         ] {
             let mode = crate::config::Config::load(
                 args.iter().map(Into::into),
@@ -1069,6 +1084,13 @@ mod tests {
             assert!(
                 lines.iter().any(|l| l.contains("shutting down")),
                 "{lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| {
+                    let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                    v["message"] == "ukubi-stt starting" && v["version"] == super::VERSION
+                }),
+                "no start line with the version: {lines:?}"
             );
             for l in lines.iter() {
                 let v: serde_json::Value = serde_json::from_str(l).unwrap();

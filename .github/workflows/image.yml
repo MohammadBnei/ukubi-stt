@@ -3,7 +3,7 @@
 # already paid for once:
 #   - every buildah call goes through sudo (rootless splits the auth file)
 #   - --tls-verify=false on login AND push (plain HTTP; LE can't issue for .lan)
-#   - no Node on that box, so read the version with shell, not node -p
+#   - no Node on that box; the version comes from ukubi-ci release, never a package.json
 #
 # The deploy job bumps helm/values.yaml's image.tag AFTER the push, never
 # before. Editing that tag in a feature PR looks equivalent and is not: ArgoCD
@@ -17,7 +17,8 @@ name: image
 # One run: push to main -> checks -> release (version + changelog) -> image build and push
 # -> helm tag bump. Previously the release was cut by hand locally and this workflow waited
 # for the tag it produced, which meant the tag had to trigger a workflow — so it could never
-# be pushed by the built-in token. Sequential jobs need no trigger.
+# be pushed by the built-in token. Sequential jobs need no trigger. A dispatch on main runs
+# the same chain; a dispatch elsewhere is a dry-run release and a build, never a deploy.
 on:
   workflow_dispatch:
   pull_request:
@@ -26,17 +27,16 @@ on:
       - main
     paths-ignore:
       # Cargo.toml and Cargo.lock are NOT here: a dependency-only security bump has to run
-      # the checks, and then ships like any other push — the angular preset bumps at least a
-      # patch for every commit type, chore(deps) included; use `fix(deps):` so CHANGELOG.md
-      # lists it. That makes the GITHUB_TOKEN rule the ONLY loop-breaker — the release commit
-      # (CHANGELOG.md, package.json, Cargo.toml, Cargo.lock) and deploy's helm bump are
-      # pushed with it, and its pushes trigger no workflow. If a release flow ever pushes with
-      # a PAT or App token, it must add its own guard (e.g. skip when the head commit is
-      # `chore: release`), or it re-runs and re-pushes the same version.
+      # the checks, and then ships like any other push — ukubi-ci's git-cliff config files
+      # every commit type it does not skip under "Other" and bumps at least a patch, so
+      # chore(deps) releases too (use `fix(deps):` to list it under Fixes). That makes the
+      # GITHUB_TOKEN rule the ONLY loop-breaker — the release commit (CHANGELOG.md only) and
+      # deploy's helm bump are pushed with it, and its pushes trigger no workflow. If a
+      # release flow ever pushes with a PAT or App token, it must add its own guard, or it
+      # re-runs and re-pushes the same version.
       - '**.md'
       - 'helm/**'
       - 'k8s/**'
-      - 'package.json'
     tags-ignore:
       - '*'
 
@@ -85,66 +85,28 @@ jobs:
       layers: false
       pull-newer: false
 
-  # Cuts the version and CHANGELOG. This was a local `bun run release` until now, which is
-  # why nothing in CI ever versioned this repo. release-it only pushes a commit and a tag —
-  # github.release is false — which contents: write covers, so no PAT is involved.
-  #
-  # Needs cargo on the runner: release-it's after:bump hook seds Cargo.toml and runs
-  # `cargo update`, so package.json and Cargo.toml stay on the same version. That cargo
-  # obeys rust-toolchain.toml, so the pinned toolchain is installed first rather than left
-  # to rustup's (deprecated) auto-install inside an --offline hook. requireCommits is true
-  # with requireCommitsFail false in the config, so a push with nothing releasable exits
-  # clean rather than red.
+  # Cuts the version and CHANGELOG with ukubi-ci's git-cliff release: a bare X.Y.Z tag (it
+  # keeps the prefix the existing 0.8.0 … 0.10.2 tags use), `chore(release): X.Y.Z` touching
+  # CHANGELOG.md only, one atomic push with GITHUB_TOKEN. A push or dispatch on main
+  # releases; anything else (PRs included) is a dry run whose would-be version and section go
+  # to the step summary. contents: write is needed even on PRs: GitHub checks a called
+  # workflow's permissions before any job starts.
   release:
     needs: checks
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Install the pinned toolchain
-        run: rustup toolchain install
-
-      - uses: oven-sh/setup-bun@v2
-
-      - name: Install dependencies
-        run: bun install
-
-      - name: git config
-        run: |
-          git config user.name "ukubi-stt-ci"
-          git config user.email "noreply@bnei.dev"
-
-      - name: Run release-it
-        run: git update-index --refresh && git diff-index --quiet HEAD || git reset --hard && bun run release
-
-      - name: Read the released version
-        id: version
-        run: |
-          set -euo pipefail
-          # Cargo.toml is the source of truth the image tag is read from, so read it here too
-          # rather than package.json — if the after:bump hook ever failed, this catches it.
-          v=$(grep -m1 '^version *= *"' Cargo.toml | cut -d'"' -f2)
-          [ -n "$v" ] || { echo "::error::no version in Cargo.toml"; exit 1; }
-          echo "version=$v" >> "$GITHUB_OUTPUT"
+    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@e784a69d5fe0b258b1b6899f89d42ee87eb89d5c # v0.2.1
 
   build-push:
     needs: [checks, release]
-    # always() plus an explicit check: `release` is push-only, so a dispatch skips it and the
-    # implicit success()-on-needs would skip the build too. 'skipped' passes, 'failure' does
-    # not. PRs never run it — this job is the only one that needs the LAN, and a PR has
-    # nothing to push (image-check builds PRs on a hosted runner).
+    # always() plus explicit results, so the condition reads the same for push and dispatch.
+    # PRs never run it — this job is the only one that needs the LAN, and a PR has nothing
+    # to push (image-check builds PRs on a hosted runner).
     if: >-
       always()
       && github.event_name != 'pull_request'
       && needs.checks.result == 'success'
-      && needs.release.result != 'failure'
+      && needs.release.result == 'success'
     runs-on: [self-hosted, ukubi-build]
     permissions:
       contents: read
@@ -154,23 +116,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # The tag release-it just made on a release run; the dispatched ref otherwise.
-          # Checking out main on a release run would race the next push.
-          ref: ${{ needs.release.outputs.version || github.ref }}
+          # The release commit by its tag. Empty on a dry run, or when nothing was released
+          # and the tip is untagged: then the triggering commit. Checking out main on a
+          # release run would race the next push.
+          ref: ${{ needs.release.outputs.tag }}
           fetch-depth: 0
 
+      # The image is tagged with the commit, not the version: a version tag would be pushed
+      # again for every build that releases nothing, and zot keeps only the 2 most recently
+      # pushed ukubi-stt tags, so a second tag per build would halve the rollback window.
+      # The version rides along as a build-arg (OCI label, start line, --version).
       - name: Compute the image tag
         id: tag
-        run: |
-          set -euo pipefail
-          # Cargo.toml is TOML, so no jq. First `version = "..."` in [package].
-          version=$(grep -m1 '^version *= *"' Cargo.toml | cut -d'"' -f2)
-          [ -n "$version" ] || { echo "::error::no version in Cargo.toml"; exit 1; }
-          # The assert that compared this against github.ref_name is gone. It guarded a
-          # disagreement between the version built and the tag deploy pinned, and that cannot
-          # happen now: deploy pins this job's own output, so it pins exactly what was pushed.
-          # It would also fail every run, since on a branch push ref_name is "main".
-          echo "value=$version" >> "$GITHUB_OUTPUT"
+        run: echo "value=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
 
       # Only REGISTRY_PASSWORD, not the whole environment.
       - name: Read the registry password from Infisical
@@ -203,15 +161,34 @@ jobs:
       - name: Build and push
         env:
           TAG: ${{ steps.tag.outputs.value }}
+          VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
         run: |
           set -euo pipefail
+          # An empty or misnamed output would ship version "" silently. Empty is valid only
+          # untagged: no release exists yet and main moved on.
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ( -z "$VERSION" && -z "$RELEASE_TAG" ) ]] \
+            || { echo "::error::bad VERSION '$VERSION' from release; rerun: gh workflow run image.yml --ref main"; exit 1; }
+          # No release tag: this commit is not a release. On main VERSION is the last release
+          # (main moved on mid-release, or nothing releasable), so X.Y.Z+<sha>, or 0.0.0+<sha>
+          # before the first. Elsewhere it is a dry run and VERSION the release it would cut,
+          # so X.Y.Z-dev+<sha>.
+          if [ -z "$RELEASE_TAG" ]; then
+            if [ "$GITHUB_REF" = refs/heads/main ]; then
+              VERSION="${VERSION:-0.0.0}+$TAG"
+            else
+              VERSION="$VERSION-dev+$TAG"
+            fi
+          fi
           sudo buildah bud \
             --isolation chroot \
             --format docker \
             -f Dockerfile \
+            --build-arg "VERSION=$VERSION" \
             -t "$REGISTRY/$IMAGE:$TAG" \
             -t "$REGISTRY/$IMAGE:latest" \
             .
+          # latest stays because zot's retention pins it for ukubi-stt.
           for t in "$TAG" latest; do
             sudo buildah push --tls-verify=false "$REGISTRY/$IMAGE:$t"
           done
@@ -222,16 +199,16 @@ jobs:
   # Only now does ArgoCD get told about the new tag. Shape copied from
   # agent-fleet's docker.yml, including its two hard-won details.
   deploy:
-    needs: [release, build-push]
+    needs: [build-push]
     # always() + an explicit result check, not a bare `if: github.event_name ==
     # 'push'`. agent-fleet recorded this from a live v1.1.0 run: the build
     # genuinely succeeded and deploy was still skipped with zero steps, because
     # a job's implicit default condition is success()-on-needs and the job graph
     # was tripping it. always() bypasses the implicit check, so the explicit
     # comparison below is what actually guards against deploying a failed build.
+    # Only main deploys: a dispatch on another branch builds that branch and stops here.
     if: >-
-      always() && github.event_name == 'push' &&
-      needs.release.result == 'success' &&
+      always() && github.ref == 'refs/heads/main' &&
       needs.build-push.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -251,6 +228,7 @@ jobs:
       - name: Bump the pinned image tag
         run: |
           set -euo pipefail
+          [ -n "$TAG" ] || { echo "::error::empty image tag"; exit 1; }
           sed -i -E "s/^(  tag: \")[^\"]+(\")/\1${TAG}\2/" helm/values.yaml
 
           # A no-op sed is the real failure mode here: if the pattern stops

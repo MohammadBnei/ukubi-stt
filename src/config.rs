@@ -61,6 +61,8 @@ pub enum Mode {
         wav: Option<PathBuf>,
         reference: Option<String>,
     },
+    /// `--version`: print the build's version and exit.
+    Version,
 }
 
 /// `(name, token)` per caller, sorted by name, names unique and non-empty.
@@ -253,6 +255,7 @@ fn load_recorded(
         Selftest(Option<PathBuf>),
         Stream,
         Fa(Option<PathBuf>, Option<String>),
+        Version,
     }
     let want = if first.is_none() {
         Some(Want::Serve)
@@ -263,10 +266,12 @@ fn load_recorded(
     } else if is("--selftest-fa") {
         let wav = args.next().map(PathBuf::from);
         Some(Want::Fa(wav, args.next()))
+    } else if is("--version") {
+        Some(Want::Version)
     } else {
         errors.push(format!(
             "unknown argument {:?} — expected --selftest [wav], --selftest-stream, \
-             or --selftest-fa [wav] [reference text]",
+             --selftest-fa [wav] [reference text], or --version",
             first.as_deref().unwrap_or_default()
         ));
         None
@@ -349,6 +354,7 @@ fn load_recorded(
         Want::Selftest(wav) => Mode::Selftest { wav },
         Want::Stream => Mode::SelftestStream,
         Want::Fa(wav, reference) => Mode::SelftestFa { wav, reference },
+        Want::Version => Mode::Version,
     });
 
     let reads = Reads {
@@ -473,7 +479,7 @@ mod tests {
             err(&["--bogus"], &bad),
             [
                 "unknown argument \"--bogus\" — expected --selftest [wav], --selftest-stream, \
-                 or --selftest-fa [wav] [reference text]",
+                 --selftest-fa [wav] [reference text], or --version",
                 r#"STT_MAX_SESSIONS="lots" is not a positive integer"#,
                 r#"STT_FA_DEVICE="bogus" — expected "cpu" or "cuda""#,
             ]
@@ -496,9 +502,16 @@ mod tests {
             &["--selftest"][..],
             &["--selftest-stream"],
             &["--selftest-fa"],
+            &["--version"],
         ] {
             load(args, &[]).unwrap();
         }
+    }
+
+    #[test]
+    fn version_needs_nothing() {
+        let c = load(&["--version"], &[]).unwrap();
+        assert!(matches!(c.mode, Mode::Version), "{:?}", c.mode);
     }
 
     #[test]
@@ -601,7 +614,7 @@ mod tests {
             err(&[""], &[]),
             [
                 "unknown argument \"\" — expected --selftest [wav], --selftest-stream, \
-              or --selftest-fa [wav] [reference text]"
+              --selftest-fa [wav] [reference text], or --version"
             ]
         );
     }

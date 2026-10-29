@@ -109,7 +109,7 @@ export function prewarm() {
       const c = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
       // Built from a Blob so this module stays a single file with no sibling
       // asset to deploy alongside it.
-      const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
+      const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
       try {
         await c.audioWorklet.addModule(url);
       } finally {
@@ -118,13 +118,17 @@ export function prewarm() {
       return c;
     })();
     // A failed warm must not be cached, or the button is dead until reload.
-    warmPromise.catch(() => { warmPromise = null; });
+    warmPromise.catch(() => {
+      warmPromise = null;
+    });
   }
   return warmPromise;
 }
 
 export function createDictation({ send, onError = () => {}, onLevel = () => {} }) {
-  let ctx = null, stream = null, node = null;
+  let ctx = null,
+    stream = null,
+    node = null;
   let chain = Promise.resolve();
   let abandoned = false;
   let onTail = null;
@@ -162,7 +166,12 @@ export function createDictation({ send, onError = () => {}, onLevel = () => {} }
     // no reason, and every millisecond here is speech the user has already
     // said into a graph that does not exist yet.
     const micPromise = navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
     });
     // Do not let an unhandled rejection escape if the context work throws first.
     micPromise.catch(() => {});
@@ -177,20 +186,25 @@ export function createDictation({ send, onError = () => {}, onLevel = () => {} }
     // context runs no worklet — it would look live and capture silence. resume()
     // is called from the click that reached start(), which is what makes it
     // allowed.
-    if (ctx.state === "suspended") await ctx.resume();
+    if (ctx.state === 'suspended') await ctx.resume();
 
-    node = new AudioWorkletNode(ctx, "chunker", {
-      numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1,
-      processorOptions: { chunkSamples: CHUNK_SAMPLES },
+    node = new AudioWorkletNode(ctx, 'chunker', {
+      numberOfInputs: 1,
+      numberOfOutputs: 0,
+      channelCount: 1,
+      processorOptions: { chunkSamples: CHUNK_SAMPLES }
     });
 
-    node.port.onmessage = (e) => {
+    node.port.onmessage = e => {
       const m = e.data;
-      if (m.type === "peak") onLevel(m.value);
-      else if (m.type === "chunk") enqueue(toPCM16(m.samples), false);
-      else if (m.type === "tail") {
+      if (m.type === 'peak') onLevel(m.value);
+      else if (m.type === 'chunk') enqueue(toPCM16(m.samples), false);
+      else if (m.type === 'tail') {
         enqueue(toPCM16(m.samples), true);
-        if (onTail) { onTail(); onTail = null; }
+        if (onTail) {
+          onTail();
+          onTail = null;
+        }
       }
     };
 
@@ -205,21 +219,41 @@ export function createDictation({ send, onError = () => {}, onLevel = () => {} }
       // Ask for the partial tail and wait for it before tearing the graph down,
       // or that audio dies with the worklet and the server never gets its close.
       // Bounded, so a worklet that never answers cannot wedge the caller.
-      await new Promise((resolve) => {
-        const timer = setTimeout(() => { onTail = null; resolve(); }, 1000);
-        onTail = () => { clearTimeout(timer); resolve(); };
-        node.port.postMessage("flush");
+      await new Promise(resolve => {
+        const timer = setTimeout(() => {
+          onTail = null;
+          resolve();
+        }, 1000);
+        onTail = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        node.port.postMessage('flush');
       });
       node.port.onmessage = null;
       node.disconnect();
       node = null;
     }
-    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
-    if (ctx) { await ctx.close(); ctx = null; }
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    if (ctx) {
+      await ctx.close();
+      ctx = null;
+    }
     // Await the queue, so a caller that re-enables its UI after stop() is not
     // doing so while text is still arriving.
     await chain;
   }
 
-  return { start, stop, get abandoned() { return abandoned; }, CHUNK_SAMPLES, SAMPLE_RATE };
+  return {
+    start,
+    stop,
+    get abandoned() {
+      return abandoned;
+    },
+    CHUNK_SAMPLES,
+    SAMPLE_RATE
+  };
 }

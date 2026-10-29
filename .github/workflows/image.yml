@@ -18,7 +18,7 @@ name: image
 # -> helm tag bump. Previously the release was cut by hand locally and this workflow waited
 # for the tag it produced, which meant the tag had to trigger a workflow — so it could never
 # be pushed by the built-in token. Sequential jobs need no trigger. A dispatch on main runs
-# the same chain; a dispatch elsewhere is a dry-run release and a build, never a deploy.
+# the same chain; a dispatch elsewhere is a dry-run release and a build, never a push or deploy.
 on:
   workflow_dispatch:
   pull_request:
@@ -41,10 +41,11 @@ on:
       - '*'
 
 # Two pushes must not compute the same version from the same latest tag and lose one.
-# A pull request gets a group of its own: in the shared one, every push to main
-# cancelled whichever PR's checks were running, and the reverse.
+# Every other ref (a PR, a dispatch on a branch) gets a group of its own: in the shared
+# one, every push to main cancelled whichever PR's checks were running, and a branch
+# dispatch could cancel a main run between its tag push and its deploy.
 concurrency:
-  group: release-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  group: release-${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -170,14 +171,14 @@ jobs:
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ( -z "$VERSION" && -z "$RELEASE_TAG" ) ]] \
             || { echo "::error::bad VERSION '$VERSION' from release; rerun: gh workflow run image.yml --ref main"; exit 1; }
           # No release tag: this commit is not a release. On main VERSION is the last release
-          # (main moved on mid-release, or nothing releasable), so X.Y.Z+<sha>, or 0.0.0+<sha>
-          # before the first. Elsewhere it is a dry run and VERSION the release it would cut,
-          # so X.Y.Z-dev+<sha>.
+          # (main moved on mid-release, or nothing releasable), so X.Y.Z+<sha>. Elsewhere it is
+          # a dry run and VERSION the release it would cut, so X.Y.Z-dev+<sha>. 0.0.0 before
+          # the first release.
           if [ -z "$RELEASE_TAG" ]; then
             if [ "$GITHUB_REF" = refs/heads/main ]; then
               VERSION="${VERSION:-0.0.0}+$TAG"
             else
-              VERSION="$VERSION-dev+$TAG"
+              VERSION="${VERSION:-0.0.0}-dev+$TAG"
             fi
           fi
           sudo buildah bud \
@@ -188,10 +189,14 @@ jobs:
             -t "$REGISTRY/$IMAGE:$TAG" \
             -t "$REGISTRY/$IMAGE:latest" \
             .
-          # latest stays because zot's retention pins it for ukubi-stt.
-          for t in "$TAG" latest; do
-            sudo buildah push --tls-verify=false "$REGISTRY/$IMAGE:$t"
-          done
+          # latest stays because zot's retention pins it for ukubi-stt. Only main pushes: zot
+          # keeps just 2 ukubi-stt tags, so a branch build would evict the rollback image and
+          # overwrite latest with unreleased code.
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            for t in "$TAG" latest; do
+              sudo buildah push --tls-verify=false "$REGISTRY/$IMAGE:$t"
+            done
+          fi
           # The LXC shares one thin-provisioned rootfs with the other build
           # repos and this image is ~5GB. Leaving it behind fills the pool.
           sudo buildah rmi "$REGISTRY/$IMAGE:$TAG" "$REGISTRY/$IMAGE:latest" || true

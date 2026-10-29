@@ -77,7 +77,15 @@ first, and what `ukubi-stt --version` prints. A build that is not a release
 reports `X.Y.Z+<sha>` on `main` or `X.Y.Z-dev+<sha>` elsewhere; a plain `cargo
 build` reports `dev`. `deploy` then pins that SHA as `image.tag` in
 `helm/values.yaml` for ArgoCD. To release or rebuild the tip by hand:
-`gh workflow run image.yml --ref main`.
+`gh workflow run image.yml --ref main`. With nothing to release the tip is
+usually the `chore(deploy)` bump, so this builds and deploys it as a new
+`X.Y.Z+<sha>` image, not the tagged one.
+
+A `*.md`, `helm/**` or `k8s/**` push starts no run (see CI), and ukubi-ci's
+release treats it as newer work it must not release over: if one lands while
+a run for an earlier push reaches its release job, that run releases
+nothing and ships as `X.Y.Z+<sha>`. Its commits go out with the next
+releasable push, or now with the dispatch above.
 
 ## Running the gate
 
@@ -565,7 +573,7 @@ One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below);
 | `image-check` | GitHub-hosted (buildah, no push) | PRs | the Dockerfile builds |
 | `trailers` (`trailers.yml`) | GitHub-hosted | PRs | Conventional titles/commits, trailer pair |
 | `release` (ukubi-ci `release.yml`) | GitHub-hosted | PRs (dry run) and pushes | git-cliff cuts the version, CHANGELOG and tag |
-| `build-push` | build-runner LXC (`[self-hosted, ukubi-build]`) | pushes and dispatches | that it builds into a CUDA image and pushes it under the commit SHA |
+| `build-push` | build-runner LXC (`[self-hosted, ukubi-build]`) | pushes and dispatches | that it builds into a CUDA image; on `main` it pushes it under the commit SHA |
 | `deploy` | GitHub-hosted | pushes and dispatches on `main` | bumps `image.tag` in `helm/values.yaml` |
 
 A push to `main` that touches only `*.md`, `helm/**`, `k8s/**` (one-shot

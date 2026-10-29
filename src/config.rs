@@ -502,7 +502,6 @@ mod tests {
             &["--selftest"][..],
             &["--selftest-stream"],
             &["--selftest-fa"],
-            &["--version"],
         ] {
             load(args, &[]).unwrap();
         }

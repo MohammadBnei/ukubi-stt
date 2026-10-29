@@ -438,7 +438,7 @@ them: it is a build-time input (the Dockerfile's build-arg, read by
 | `--selftest [wav]` | load the batch model, assert CUDA, transcribe the WAV or a synthetic sweep |
 | `--selftest-stream` | load both models and report total GPU use |
 | `--selftest-fa [wav] [reference]` | load the Persian model, decode the WAV, report CER against the reference |
-| `--version` | print the release version on stdout and exit; needs no credential |
+| `--version` | print the release version on stdout and exit; needs no credential, but still validates the environment and logs the start line on stderr |
 
 Arguments after the ones shown are ignored. Anything else as the first
 argument refuses to start.

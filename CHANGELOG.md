@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.11.0 - 2026-10-29
+
+### Features
+
+- **errors:** ErrorKey detail on every Status, no internal text to clients (#29)
+- **logs:** Tracing JSON on stdout (#30)
+- **traces:** Opt-in tracing-opentelemetry via OTEL_EXPORTER_OTLP_TRACES_ENDPOINT (#31)
+- **helm:** Run as non-root with a restricted securityContext (#32)
+- --version and a start line; releases via ukubi-ci git-cliff (#35)
+
+### Fixes
+
+- **web:** A word split across a chunk boundary became two words (#24)
+- Shut down on SIGTERM; stop PRs and main sharing one concurrency group (#26)
+
+### Other
+
+- One pipeline — checks, release, build and deploy in a single run (#25)
+- Check dependency bumps, blocking audit, pinned toolchain, buf lint and breaking (#27)
+- **config:** One Config struct from an injected env, every error at once (#28)
+- Add CLAUDE.md with tier and trailer rule; drop stale gate pod manifest (#33)
+- Call ukubi-ci reusable checks; declare tier and trailer rule (#34)
+
 ## [0.10.2](https://github.com/MohammadBnei/ukubi-stt/compare/0.10.1...0.10.2) (2026-09-02)
 
 

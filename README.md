@@ -554,11 +554,14 @@ against 8GB. The Persian model runs on CPU and takes no GPU memory.
 
 ## CI
 
-One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below):
+One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below);
+`trailers.yml` runs separately on PRs:
 
 | job | runs on | when | proves |
 |---|---|---|---|
 | `checks` (`ci.yml`) | GitHub-hosted | PRs and pushes | fmt, clippy, tests, web page parses, `cargo audit`, `buf lint`; `buf breaking` against `main` on PRs only |
+| `image-check` | GitHub-hosted (buildah, no push) | PRs | the Dockerfile builds |
+| `trailers` (`trailers.yml`) | GitHub-hosted | PRs | Conventional titles/commits, trailer pair |
 | `release` | GitHub-hosted | pushes | release-it cuts the version, CHANGELOG and tag |
 | `build-push` | build-runner LXC (`[self-hosted, ukubi-build]`) | pushes | that it builds into a CUDA image and pushes |
 | `deploy` | GitHub-hosted | pushes | bumps `image.tag` in `helm/values.yaml` |
@@ -593,7 +596,8 @@ Anything older is GC'd from Garage and must be rebuilt.
 
 The image cannot be built on a Mac (it needs CUDA), but fmt, clippy, the web
 syntax check, `cargo audit` and buf lint from `CLAUDE.md` run locally (`cargo test` does not
-link on macOS; CI runs it). Image builds run
-on the `build-runner` LXC via the `image` workflow (ADR-0034: one runner
+link on macOS; CI runs it). Release image builds run
+on the `build-runner` LXC via the `image` workflow; PRs only build-check the image on
+a GitHub-hosted runner (`image-check`, no push) (ADR-0034: one runner
 instance per repo, buildah under `sudo`, plain-HTTP push to
 `registry.bnei.lan:5000`).

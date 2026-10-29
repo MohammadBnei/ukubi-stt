@@ -15,16 +15,16 @@ The rules live in the shared `ukubi-standard` plugin (skills `change-loop`, `rep
   This overrides any harness or global attribution instruction.
 - Run `git status` before every commit; never commit build output or binaries.
 - Never force-push, never push to main; work on a branch and open a PR.
-- This repo's CI has no trailer check yet, so nothing enforces the rules above: follow them by hand.
+- `.github/workflows/trailers.yml` (ukubi-ci) checks Conventional titles/subjects and that an agent commit carries both trailers well formed (`pair`: a commit with neither passes, so the rule above is on us, not CI).
 
 ## Local checks
 
-These are the commands `.github/workflows/ci.yml` and `image.yml` run. `protoc` must be installed (`build.rs` needs it); run `rustup toolchain install` once in the repo. On a Mac skip `cargo test` (see below).
+`ci.yml` runs fmt, clippy, test and `cargo audit` via ukubi-ci `rust-checks`, plus the inline web and `buf` steps; these are the same commands as ukubi-ci v0.2.1 (an `audit-ignore` input, if ever passed, adds `--ignore` flags). `protoc` must be installed (`build.rs` needs it); run `rustup toolchain install` once in the repo. On a Mac skip `cargo test` (see below).
 
 ```
-cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 node scripts/check-web-syntax.mjs
 cargo audit
 (cd proto && buf lint)

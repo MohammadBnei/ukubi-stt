@@ -20,86 +20,30 @@ name: ci
 on:
   workflow_call:
 
-env:
-  CARGO_TERM_COLOR: always
-  # dtolnay/rust-toolchain used to retry flaky downloads; the plain rustup
-  # install below does not, so at least let cargo retry its own.
-  CARGO_NET_RETRY: 10
-
 jobs:
-  check:
+  # fmt, clippy, test and cargo audit come from ukubi-ci, pinned by sha. CI only proves
+  # compile, format, lint, tests. Blocking audit ignores live in .cargo/audit.toml with
+  # their reasons.
+  #
+  # No `--features cuda`: ukubi-stt declares no features; parakeet-rs/cuda is on
+  # unconditionally in Cargo.toml, so a plain build compiles exactly what ships. An earlier
+  # `--features cuda` failed with "the package 'ukubi-stt' does not contain this feature".
+  #
+  # apt-packages: tonic-prost-build needs protoc. The Dockerfile installs the same
+  # protobuf-compiler package; keep the two in step.
+  rust:
+    uses: MohammadBnei/ukubi-ci/.github/workflows/rust-checks.yml@e784a69d5fe0b258b1b6899f89d42ee87eb89d5c # v0.2.1
+    with:
+      apt-packages: protobuf-compiler
+
+  # web/index.html is include_str!'d into the binary, so a syntax error in it compiles,
+  # ships, and shows up only in a browser console. ukubi-ci has no equivalent.
+  web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-
-      # No arguments: installs exactly what rust-toolchain.toml names, components
-      # included, so that file is the only place the version lives. Before
-      # rust-cache, which keys on the rustc version. The second line fails the job
-      # if the pin is not what is active (e.g. the file was not picked up).
-      - name: Install the pinned toolchain
-        run: |
-          rustup toolchain install
-          rustup show active-toolchain | tee /dev/stderr | grep -q 'rust-toolchain.toml'
-
-      # tonic-prost-build shells out to protoc, so build.rs fails without it.
-      # ubuntu-latest does not ship it. The Dockerfile installs the same
-      # package; keep the two in step.
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
-
-      # Caches ~/.cargo and target/. The parakeet-rs -> ort -> ndarray/tokenizers
-      # tree is the slow part and it changes only when Cargo.toml does.
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Format
-        run: cargo fmt --check
-
-      # No --features flag. `--features` selects features of THIS package, and
-      # ukubi-stt declares none — parakeet-rs/cuda is turned on unconditionally
-      # in Cargo.toml, so a plain build already compiles exactly the program
-      # that ships, ExecutionProvider::Cuda included. An earlier
-      # `--features cuda` here failed with "the package 'ukubi-stt' does not
-      # contain this feature", which is the distinction stated out loud.
-      #
-      # Whether ort 2.0.0-rc.13 resolves its CUDA build on a runner with no CUDA
-      # toolkit is still genuinely unknown. If this fails inside ort's build
-      # script rather than on our code, that is information Gate 0 wants, and
-      # the fix is a real `cuda` feature on this package so CI can check the CPU
-      # path while the image keeps the GPU one.
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --locked
-
-      # web/index.html is include_str!'d into the binary, so a syntax error in it
-      # compiles, ships, and shows up only in a browser console. One did: toPCM16
-      # was both imported and redeclared, which kills the module at parse time and
-      # made the whole page inert. It survived four releases because the only
-      # check anyone ran was that `/` returned 200 — which it did throughout.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Check the browser page parses
         run: node scripts/check-web-syntax.mjs
-
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Install the pinned toolchain
-        run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked --version 0.22.2
-      # Blocking. A vulnerability fails `checks`, which stops release, build and
-      # deploy on main. An accepted one goes in .cargo/audit.toml with its reason
-      # and fixed version; this step is never made non-blocking. Warnings (unmaintained,
-      # unsound) do not fail it. Two red modes are not advisories: "error loading
-      # advisory database" means the pinned cargo-audit is too old for the DB
-      # format — bump the pin above, do not ignore an ID; and a failed fetch of
-      # the DB from GitHub is transient — re-run.
-      - name: Audit
-        run: cargo audit
 
   # The proto contract. Codegen stays in build.rs (tonic-prost-build); this only
   # lints the schema and refuses wire breaks against main. Same shape as
@@ -107,12 +51,12 @@ jobs:
   buf:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # origin/main for buf breaking and for the BREAKING CHANGE: scan.
           fetch-depth: 0
 
-      - uses: bufbuild/buf-setup-action@v1
+      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           version: 1.72.0
 

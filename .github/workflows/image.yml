@@ -35,6 +35,7 @@ on:
       # `chore: release`), or it re-runs and re-pushes the same version.
       - '**.md'
       - 'helm/**'
+      - 'k8s/**'
       - 'package.json'
     tags-ignore:
       - '*'

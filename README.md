@@ -76,6 +76,11 @@ pushes the image from the new tag, then its deploy job bumps `image.tag` in
 `helm/values.yaml` for ArgoCD to pick up. A local `bun run release` is no
 longer the normal path.
 
+**Known broken (2026-10-28):** the release job fails in the `after:bump` hook:
+`cargo update -p ukubi-stt --offline` finds no crates in the runner's cold
+cargo cache ("no matching package named `anyhow`"). Until that hook is fixed,
+pushes to `main` cut no release and build nothing.
+
 ## Running the gate
 
 The startup assertion runs on every boot, but `--selftest` is the manual
@@ -84,14 +89,24 @@ there is no point in the build where a GPU is reachable.
 
 Do not `kubectl exec` these into the live pod: its two resident models take
 about 6880 MiB of the card's 8192, and loading another on top OOMs the
-service. Run them in a one-shot pod instead (k8s/gate-fa-pod.yaml is the
-current template). The Persian gate needs no GPU and no outage. A CUDA
-selftest needs the Deployment stopped, and that must go through git: a hand
-scale-down is undone by ArgoCD selfHeal.
+service. Run them in a one-shot pod instead.
+
+- **Persian** (`--selftest-fa`): `k8s/gate-fa-pod.yaml` runs it as is. It needs
+  no GPU and no outage.
+- **CUDA** (`--selftest`, `--selftest-stream`): no manifest ships for it. Adapt
+  `gate-fa-pod.yaml`: a current image tag, the command below, and BOTH
+  `runtimeClassName: nvidia` and an `nvidia.com/gpu: 1` limit. Neither implies
+  the other (ADR-0043 Decision 3): without the RuntimeClass no driver is
+  injected, so `nvidia-smi` is missing and the gate reads 0 MiB; without the
+  limit the scheduler does not account for the GPU. It contends for the single
+  card, so stop the Deployment first through git (`replicaCount: 0` in
+  `helm/values.yaml`, by PR): a hand scale-down is undone by ArgoCD selfHeal.
 
 ```bash
-ukubi-stt --selftest            # synthetic
-ukubi-stt --selftest /tmp/a.wav # real audio
+ukubi-stt --selftest                   # synthetic
+ukubi-stt --selftest /tmp/a.wav        # real audio
+ukubi-stt --selftest-stream            # load BOTH models, report total GPU use
+ukubi-stt --selftest-fa [wav] [ref]    # Persian, CPU; CER only when ref is set
 ```
 
 Pass looks like:
@@ -548,8 +563,8 @@ One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below):
 | `build-push` | build-runner LXC (`[self-hosted, ukubi-build]`) | pushes | that it builds into a CUDA image and pushes |
 | `deploy` | GitHub-hosted | pushes | bumps `image.tag` in `helm/values.yaml` |
 
-A push to `main` that touches only `*.md`, `helm/**` or `package.json` runs
-nothing. Any other push, a `Cargo.toml`/`Cargo.lock`-only bump included, runs
+A push to `main` that touches only `*.md`, `helm/**`, `k8s/**` (one-shot
+manifests, never in the image) or `package.json` runs nothing. Any other push, a `Cargo.toml`/`Cargo.lock`-only bump included, runs
 the whole pipeline and ships: the angular preset bumps at least a patch for
 every commit type, so even a `chore(deps):` bump cuts a release. Only `feat`,
 `fix`, `perf` and `revert` commits are listed in `CHANGELOG.md`, so commit a
@@ -577,7 +592,7 @@ Anything older is GC'd from Garage and must be rebuilt.
 ## Local build
 
 The image cannot be built on a Mac (it needs CUDA), but fmt, clippy, the web
-syntax check and buf lint from `CLAUDE.md` run locally (`cargo test` does not
+syntax check, `cargo audit` and buf lint from `CLAUDE.md` run locally (`cargo test` does not
 link on macOS; CI runs it). Image builds run
 on the `build-runner` LXC via the `image` workflow (ADR-0034: one runner
 instance per repo, buildah under `sudo`, plain-HTTP push to

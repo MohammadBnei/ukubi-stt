@@ -80,11 +80,16 @@ longer the normal path.
 
 The startup assertion runs on every boot, but `--selftest` is the manual
 version — ADR-0044 Decision 3 keeps it as a flag, not a build gate, because
-there is no point in the build where a GPU is reachable:
+there is no point in the build where a GPU is reachable.
+
+Do not run these against the live Deployment: its resident models already
+fill most of the card, and loading another on top OOMs the service
+(k8s/gate-pod.yaml). Run them in a one-shot pod while the Deployment is
+scaled to 0 (k8s/gate-fa-pod.yaml is the current template):
 
 ```bash
-kubectl exec deploy/ukubi-stt -- ukubi-stt --selftest            # synthetic
-kubectl exec deploy/ukubi-stt -- ukubi-stt --selftest /tmp/a.wav # real audio
+ukubi-stt --selftest            # synthetic
+ukubi-stt --selftest /tmp/a.wav # real audio
 ```
 
 Pass looks like:

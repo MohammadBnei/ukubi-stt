@@ -104,14 +104,16 @@ podSecurityContext:
   runAsUser: 10001
   runAsGroup: 10001
   seccompProfile: {type: RuntimeDefault}
-# Main container only: the chart renders initContainers raw, so each one below
-# carries its own copy of this.
-securityContext:
+# Main container only: the chart renders initContainers raw, so fetch-model
+# reuses this through the anchor and chown-models carries its own variant.
+securityContext: &restricted
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
   capabilities: {drop: [ALL]}
-# The one writable path on a read-only root: keeps `--selftest /tmp/a.wav`
-# (README) working and gives CUDA/ORT a temp dir.
+# The one writable path on a read-only root: a temp dir for CUDA/ORT and
+# anything else that expects a writable /tmp. Not for `kubectl exec --selftest`
+# into this pod: that loads more models and OOMs the live service
+# (k8s/gate-pod.yaml).
 extraVolumes:
   - name: tmp
     emptyDir: {sizeLimit: 256Mi}
@@ -140,7 +142,7 @@ initContainers:
   # container once no root writer of /models is left.
   - name: chown-models
     image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-    imagePullPolicy: IfNotPresent
+    imagePullPolicy: "{{ .Values.image.pullPolicy }}"
     command: ["chown", "-R", "10001:10001", "/models"]
     securityContext:
       runAsUser: 0
@@ -155,12 +157,9 @@ initContainers:
       requests: {cpu: 10m, memory: 16Mi}
       limits: {cpu: 100m, memory: 64Mi}
   - name: fetch-model
-    securityContext:
-      allowPrivilegeEscalation: false
-      readOnlyRootFilesystem: true
-      capabilities: {drop: [ALL]}
+    securityContext: *restricted
     image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-    imagePullPolicy: IfNotPresent
+    imagePullPolicy: "{{ .Values.image.pullPolicy }}"
     command: ["/usr/local/bin/fetch-model.sh"]
     env:
       - name: STT_MODEL_DIR

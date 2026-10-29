@@ -113,7 +113,7 @@ securityContext: &restricted
 # The one writable path on a read-only root: a temp dir for CUDA/ORT and
 # anything else that expects a writable /tmp. Not for `kubectl exec --selftest`
 # into this pod: that loads more models and OOMs the live service
-# (k8s/gate-pod.yaml).
+# (README "Running the gate").
 extraVolumes:
   - name: tmp
     emptyDir: {sizeLimit: 256Mi}

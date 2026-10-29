@@ -76,20 +76,37 @@ pushes the image from the new tag, then its deploy job bumps `image.tag` in
 `helm/values.yaml` for ArgoCD to pick up. A local `bun run release` is no
 longer the normal path.
 
+**Known broken (2026-10-28):** the release job fails in the `after:bump` hook:
+`cargo update -p ukubi-stt --offline` finds no crates in the runner's cold
+cargo cache ("no matching package named `anyhow`"). Until that hook is fixed,
+pushes to `main` cut no release and build nothing.
+
 ## Running the gate
 
 The startup assertion runs on every boot, but `--selftest` is the manual
 version — ADR-0044 Decision 3 keeps it as a flag, not a build gate, because
 there is no point in the build where a GPU is reachable.
 
-Do not run these against the live Deployment: its resident models already
-fill most of the card, and loading another on top OOMs the service
-(k8s/gate-pod.yaml). Run them in a one-shot pod while the Deployment is
-scaled to 0 (k8s/gate-fa-pod.yaml is the current template):
+Do not `kubectl exec` these into the live pod: its two resident models take
+about 6880 MiB of the card's 8192, and loading another on top OOMs the
+service. Run them in a one-shot pod instead.
+
+- **Persian** (`--selftest-fa`): `k8s/gate-fa-pod.yaml` runs it as is. It needs
+  no GPU and no outage.
+- **CUDA** (`--selftest`, `--selftest-stream`): no manifest ships for it. Adapt
+  `gate-fa-pod.yaml`: a current image tag, the command below, and BOTH
+  `runtimeClassName: nvidia` and an `nvidia.com/gpu: 1` limit. Neither implies
+  the other (ADR-0043 Decision 3): without the RuntimeClass no driver is
+  injected, so `nvidia-smi` is missing and the gate reads 0 MiB; without the
+  limit the scheduler does not account for the GPU. It contends for the single
+  card, so stop the Deployment first through git (`replicaCount: 0` in
+  `helm/values.yaml`, by PR): a hand scale-down is undone by ArgoCD selfHeal.
 
 ```bash
-ukubi-stt --selftest            # synthetic
-ukubi-stt --selftest /tmp/a.wav # real audio
+ukubi-stt --selftest                   # synthetic
+ukubi-stt --selftest /tmp/a.wav        # real audio
+ukubi-stt --selftest-stream            # load BOTH models, report total GPU use
+ukubi-stt --selftest-fa [wav] [ref]    # Persian, CPU; CER only when ref is set
 ```
 
 Pass looks like:
@@ -154,12 +171,11 @@ Two independent bugs, both in the Dockerfile, both now fixed:
 rather than guessed, and the binary logs ORT's own `debug` events — which
 report which provider was declined and why — instead of dropping them.
 
-### Still unknown
+### Settled
 
-**Whether `ParakeetTDT` is `Send`.** Not needed for this single-threaded
-binary, but the gRPC server's design depends on it — if it is not, the model
-needs a dedicated thread and a channel rather than a mutex. Compiling this
-binary does not exercise it.
+**`ParakeetTDT` is `Send`.** A compile-time assert in `src/engine.rs` fails
+the build if that ever stops being true, so the server can hold it behind a
+mutex.
 
 ## If the gate fails
 
@@ -399,10 +415,6 @@ around in the client.
 "Yukie cluster"). Fine for dictation into an editable box; not for anything
 acting on the transcript unreviewed.
 
-**Releases are cut by hand.** There is no release workflow here — `image.yml`
-triggers on `push: tags` and nothing creates a tag. Run `bun run release` (see
-Releasing above). Merging to `main` builds nothing.
-
 ## Reference
 
 ### Configuration
@@ -530,14 +542,15 @@ ADR-0046.
 
 | | Repo | Files |
 |---|---|---|
-| Batch (now) | [`istupakov/parakeet-tdt-0.6b-v3-onnx`](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx) | `encoder-model.onnx`, `encoder-model.onnx.data`, `decoder_joint-model.onnx`, `vocab.txt` |
-| Streaming (Phase E) | `altunenes/parakeet-rs` → `nemotron-3.5-asr-streaming-0.6b-onnx` | `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model` |
+| Batch | [`istupakov/parakeet-tdt-0.6b-v3-onnx`](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx) | `encoder-model.onnx`, `encoder-model.onnx.data`, `decoder_joint-model.onnx`, `vocab.txt` |
+| Streaming | [`tonythethompson/Nemotron-3.5-ASR-Streaming-0.6B-ONNX`](https://huggingface.co/tonythethompson/Nemotron-3.5-ASR-Streaming-0.6B-ONNX) | `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model` |
+| Persian (CPU) | `PersianML/Shenava-Koochik-v1.0-tract-streaming` | `model.onnx`, `tokens.txt` |
 
 fp32 exports, not int8: int8 is a CPU optimisation and typically runs *slower*
 on the ORT CUDA provider because of quantise/dequantise round-trips.
 
 Batch and streaming are two different models, both GPU-resident. Budget both
-against 8GB before Phase E.
+against 8GB. The Persian model runs on CPU and takes no GPU memory.
 
 ## CI
 
@@ -550,8 +563,8 @@ One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below):
 | `build-push` | build-runner LXC (`[self-hosted, ukubi-build]`) | pushes | that it builds into a CUDA image and pushes |
 | `deploy` | GitHub-hosted | pushes | bumps `image.tag` in `helm/values.yaml` |
 
-A push to `main` that touches only `*.md`, `helm/**` or `package.json` runs
-nothing. Any other push, a `Cargo.toml`/`Cargo.lock`-only bump included, runs
+A push to `main` that touches only `*.md`, `helm/**`, `k8s/**` (one-shot
+manifests, never in the image) or `package.json` runs nothing. Any other push, a `Cargo.toml`/`Cargo.lock`-only bump included, runs
 the whole pipeline and ships: the angular preset bumps at least a patch for
 every commit type, so even a `chore(deps):` bump cuts a release. Only `feat`,
 `fix`, `perf` and `revert` commits are listed in `CHANGELOG.md`, so commit a
@@ -578,7 +591,9 @@ Anything older is GC'd from Garage and must be rebuilt.
 
 ## Local build
 
-Not possible on a Mac, and not expected to be — the image needs CUDA. Builds run
+The image cannot be built on a Mac (it needs CUDA), but fmt, clippy, the web
+syntax check, `cargo audit` and buf lint from `CLAUDE.md` run locally (`cargo test` does not
+link on macOS; CI runs it). Image builds run
 on the `build-runner` LXC via the `image` workflow (ADR-0034: one runner
 instance per repo, buildah under `sudo`, plain-HTTP push to
 `registry.bnei.lan:5000`).

@@ -235,7 +235,7 @@ export function createDictation({ send, onError = () => {}, onLevel = () => {} }
       node = null;
     }
     if (stream) {
-      stream.getTracks().forEach(t => t.stop());
+      for (const t of stream.getTracks()) t.stop();
       stream = null;
     }
     if (ctx) {

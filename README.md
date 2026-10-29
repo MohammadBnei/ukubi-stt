@@ -554,7 +554,8 @@ against 8GB. The Persian model runs on CPU and takes no GPU memory.
 
 ## CI
 
-One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below):
+One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below);
+`trailers.yml` runs separately on PRs:
 
 | job | runs on | when | proves |
 |---|---|---|---|

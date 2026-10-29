@@ -82,10 +82,12 @@ The startup assertion runs on every boot, but `--selftest` is the manual
 version — ADR-0044 Decision 3 keeps it as a flag, not a build gate, because
 there is no point in the build where a GPU is reachable.
 
-Do not run these against the live Deployment: its resident models already
-fill most of the card, and loading another on top OOMs the service
-(k8s/gate-pod.yaml). Run them in a one-shot pod while the Deployment is
-scaled to 0 (k8s/gate-fa-pod.yaml is the current template):
+Do not `kubectl exec` these into the live pod: its two resident models take
+about 6880 MiB of the card's 8192, and loading another on top OOMs the
+service. Run them in a one-shot pod instead (k8s/gate-fa-pod.yaml is the
+current template). The Persian gate needs no GPU and no outage. A CUDA
+selftest needs the Deployment stopped, and that must go through git: a hand
+scale-down is undone by ArgoCD selfHeal.
 
 ```bash
 ukubi-stt --selftest            # synthetic
@@ -154,12 +156,11 @@ Two independent bugs, both in the Dockerfile, both now fixed:
 rather than guessed, and the binary logs ORT's own `debug` events — which
 report which provider was declined and why — instead of dropping them.
 
-### Still unknown
+### Settled
 
-**Whether `ParakeetTDT` is `Send`.** Not needed for this single-threaded
-binary, but the gRPC server's design depends on it — if it is not, the model
-needs a dedicated thread and a channel rather than a mutex. Compiling this
-binary does not exercise it.
+**`ParakeetTDT` is `Send`.** A compile-time assert in `src/engine.rs` fails
+the build if that ever stops being true, so the server can hold it behind a
+mutex.
 
 ## If the gate fails
 
@@ -399,10 +400,6 @@ around in the client.
 "Yukie cluster"). Fine for dictation into an editable box; not for anything
 acting on the transcript unreviewed.
 
-**Releases are cut by hand.** There is no release workflow here — `image.yml`
-triggers on `push: tags` and nothing creates a tag. Run `bun run release` (see
-Releasing above). Merging to `main` builds nothing.
-
 ## Reference
 
 ### Configuration
@@ -530,14 +527,15 @@ ADR-0046.
 
 | | Repo | Files |
 |---|---|---|
-| Batch (now) | [`istupakov/parakeet-tdt-0.6b-v3-onnx`](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx) | `encoder-model.onnx`, `encoder-model.onnx.data`, `decoder_joint-model.onnx`, `vocab.txt` |
-| Streaming (Phase E) | `altunenes/parakeet-rs` → `nemotron-3.5-asr-streaming-0.6b-onnx` | `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model` |
+| Batch | [`istupakov/parakeet-tdt-0.6b-v3-onnx`](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx) | `encoder-model.onnx`, `encoder-model.onnx.data`, `decoder_joint-model.onnx`, `vocab.txt` |
+| Streaming | [`tonythethompson/Nemotron-3.5-ASR-Streaming-0.6B-ONNX`](https://huggingface.co/tonythethompson/Nemotron-3.5-ASR-Streaming-0.6B-ONNX) | `encoder.onnx`, `encoder.onnx.data`, `decoder_joint.onnx`, `tokenizer.model` |
+| Persian (CPU) | `PersianML/Shenava-Koochik-v1.0-tract-streaming` | `model.onnx`, `tokens.txt` |
 
 fp32 exports, not int8: int8 is a CPU optimisation and typically runs *slower*
 on the ORT CUDA provider because of quantise/dequantise round-trips.
 
 Batch and streaming are two different models, both GPU-resident. Budget both
-against 8GB before Phase E.
+against 8GB. The Persian model runs on CPU and takes no GPU memory.
 
 ## CI
 
@@ -578,7 +576,9 @@ Anything older is GC'd from Garage and must be rebuilt.
 
 ## Local build
 
-Not possible on a Mac, and not expected to be — the image needs CUDA. Builds run
+The image cannot be built on a Mac (it needs CUDA), but fmt, clippy, the web
+syntax check and buf lint from `CLAUDE.md` run locally (`cargo test` does not
+link on macOS; CI runs it). Image builds run
 on the `build-runner` LXC via the `image` workflow (ADR-0034: one runner
 instance per repo, buildah under `sudo`, plain-HTTP push to
 `registry.bnei.lan:5000`).

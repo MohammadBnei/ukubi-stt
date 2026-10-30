@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.1 - 2026-10-30
+
+### Other
+
+- Lint and format JS/TS with biome (#36)
+
 ## 0.11.0 - 2026-10-29
 
 ### Features

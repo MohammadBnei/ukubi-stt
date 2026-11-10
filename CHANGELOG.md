@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.2 - 2026-11-10
+
+### Fixes
+
+- **deps:** Bump pulldown-cmark to 0.13.6 (RUSTSEC-2026-0433) (#37)
+
 ## 0.11.1 - 2026-10-30
 
 ### Other

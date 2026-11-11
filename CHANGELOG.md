@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.3 - 2026-11-11
+
+### Other
+
+- Cap cargo at 2 parallel jobs so the release build fits the 4 GB runner (#38)
+
 ## 0.11.2 - 2026-11-10
 
 ### Fixes

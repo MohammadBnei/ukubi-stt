@@ -73,6 +73,9 @@ RUN apt-get update \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --default-toolchain none --profile minimal
 ENV PATH=/root/.cargo/bin:$PATH
+# Two rustc processes at most: the 4 GB build-runner LXC was OOM-killing
+# `cargo build --release` at full parallelism (2026-11-10).
+ENV CARGO_BUILD_JOBS=2
 
 WORKDIR /src
 # The compiler is the one rust-toolchain.toml pins, not build-day stable. Copied

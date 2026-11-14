@@ -13,7 +13,7 @@ image:
   # with `strategy: Recreate` the old pod is already gone, so it is an outage
   # rather than a no-op. Hit for real on 0.4.0.
   # The value is the release commit's 12-char SHA (it was the semver up to 0.10.2).
-  tag: "52aa89a06c85"
+  tag: "a3fef055c95f@sha256:5790b1718cd813a405d636d1c449bc1c6e26b3d034d5097dfd899ed348f4e132"
   pullPolicy: IfNotPresent
 
 replicaCount: 1

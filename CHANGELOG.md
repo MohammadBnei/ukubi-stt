@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.4 - 2026-11-14
+
+### Other
+
+- **image:** Build and deploy through ukubi-ci image.yml (#39)
+
 ## 0.11.3 - 2026-11-11
 
 ### Other

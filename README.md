@@ -69,7 +69,7 @@ version is `0.x`. `chore(release)`, `chore(deploy)` and merge commits are
 skipped. `CHANGELOG.md` lists features, fixes and performance in their own
 groups and every other commit under "Other".
 
-The version is not in any file. `build-push` checks out the release tag,
+The version is not in any file. `image` (ukubi-ci `image.yml`) checks out the release tag,
 tags the image with the commit's 12-character SHA, and passes the version as
 the `VERSION` build-arg: it becomes the `org.opencontainers.image.version`
 label, the `version` field of the `ukubi-stt starting` line every mode logs
@@ -573,8 +573,7 @@ One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below);
 | `image-check` | GitHub-hosted (buildah, no push) | PRs | the Dockerfile builds |
 | `trailers` (`trailers.yml`) | GitHub-hosted | PRs | Conventional titles/commits, trailer pair |
 | `release` (ukubi-ci `release.yml`) | GitHub-hosted | PRs (dry run) and pushes | git-cliff cuts the version, CHANGELOG and tag |
-| `build-push` | build-runner LXC (`[self-hosted, ukubi-build]`) | pushes and dispatches | that it builds into a CUDA image; on `main` it pushes it under the commit SHA |
-| `deploy` | GitHub-hosted | pushes and dispatches on `main` | bumps `image.tag` in `helm/values.yaml` |
+| `image` (ukubi-ci `image.yml`) | build-runner LXC (`[self-hosted, ukubi-build]`) for the build, GitHub-hosted for the bump | pushes and dispatches | that it builds into a CUDA image; on `main` it pushes it under the commit SHA (and `latest`, same digest) and pins `image.tag` in `helm/values.yaml` as `<sha>@<digest>`, so a same-commit rebuild redeploys |
 
 A push to `main` that touches only `*.md`, `helm/**`, `k8s/**` (one-shot
 manifests, never in the image) runs nothing. Any other push, a `Cargo.toml`/`Cargo.lock`-only bump included, runs

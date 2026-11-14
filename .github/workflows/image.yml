@@ -1,17 +1,5 @@
-# Build on the build-runner LXC and push to the in-cluster Zot registry.
-# Shape copied from wedding-2026/agent-fleet, whose comments record gotchas
-# already paid for once:
-#   - every buildah call goes through sudo (rootless splits the auth file)
-#   - --tls-verify=false on login AND push (plain HTTP; LE can't issue for .lan)
-#   - no Node on that box; the version comes from ukubi-ci release, never a package.json
-#
-# The deploy job bumps helm/values.yaml's image.tag AFTER the push, never
-# before. Editing that tag in a feature PR looks equivalent and is not: ArgoCD
-# syncs main within seconds of the merge, while the image only exists minutes
-# later when the tag build finishes. Hit for real on 0.4.0 — the pod went
-# Init:ImagePullBackOff against a tag that was still being pushed, and because
-# `strategy: Recreate` had already terminated the old pod, the service was down
-# for the gap rather than merely un-upgraded.
+# Build the image on the build-runner LXC, push it to the in-cluster Zot registry and pin the
+# digest in helm/values.yaml, all through ukubi-ci's shared image.yml (see the `image` job).
 name: image
 
 # One run: push to main -> checks -> release (version + changelog) -> image build and push
@@ -48,21 +36,6 @@ concurrency:
   group: release-${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
   cancel-in-progress: true
 
-env:
-  REGISTRY: registry.bnei.lan:5000
-  # Not a secret, and an empty secret cost agent-fleet a release once.
-  REGISTRY_USER: ci
-  IMAGE: ukubi-stt
-  # The registry password comes from the shared platform-commons project over OIDC rather
-  # than a repo secret (infra-bootstrap ADR-0049): one place to rotate it for every build
-  # repo. Bound to a repository allowlist plus event_name push/workflow_dispatch — a `ref`
-  # binding cannot work, since Infisical matches claims exactly and tag refs cannot be
-  # enumerated.
-  INFISICAL_DOMAIN: https://infisical.bnei.dev
-  INFISICAL_PROJECT_SLUG: platform-commons-76pb
-  INFISICAL_ENV: dev
-  INFISICAL_IDENTITY_ID: 19807471-d73a-48d4-9e58-1dc34255ef77
-
 jobs:
   # The Rust checks, defined once in ci.yml and called here so they gate the release in the
   # same run. They used to live on their own trigger, which meant a red clippy could not stop
@@ -72,7 +45,7 @@ jobs:
 
   # PRs only: prove the Dockerfile builds (buildah, GitHub-hosted, no push), after checks so a
   # red fmt/clippy does not also pay for the CUDA build. No --layers and no --pull=newer, so it
-  # runs build-push's plain `buildah bud`. Never narrow it with `target: build`: the runtime
+  # runs image.yml's plain `buildah bud`. Never narrow it with `target: build`: the runtime
   # stage's ORT provider .so COPY is what this check exists to catch. If the hosted runner runs
   # out of disk, free space on the runner instead.
   image-check:
@@ -80,7 +53,7 @@ jobs:
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
-    uses: MohammadBnei/ukubi-ci/.github/workflows/image-build.yml@e784a69d5fe0b258b1b6899f89d42ee87eb89d5c # v0.2.1
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image-build.yml@85a8a54aab38de9020950781ca7eb1089dd9dde9 # TODO v0.6.0
     with:
       image: ukubi-stt
       layers: false
@@ -96,167 +69,46 @@ jobs:
     needs: checks
     permissions:
       contents: write
-    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@e784a69d5fe0b258b1b6899f89d42ee87eb89d5c # v0.2.1
+    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@85a8a54aab38de9020950781ca7eb1089dd9dde9 # TODO v0.6.0
 
-  build-push:
+  # Build, push and deploy live in ukubi-ci's image.yml: it builds on the build-runner LXC,
+  # pushes <sha12> (and latest, same digest) to the in-cluster Zot registry, then pins
+  # <sha12>@<digest> in helm/values.yaml AFTER the push, never before (a tag bumped ahead of
+  # its image put the Recreate pod into ImagePullBackOff on 0.4.0). The digest pin is what
+  # makes a same-commit security rebuild redeploy. Needs MohammadBnei/ukubi-stt to stay on
+  # the Infisical identity's repository allowlist (infra-bootstrap build-runner-ops).
+  #
+  # Deploy impact: `strategy: Recreate` on the single GPU node means every roll, a CVE
+  # rebuild included, is a short outage. Scheduling is deliberately untouched here.
+  image:
     needs: [checks, release]
     # always() plus explicit results, so the condition reads the same for push and dispatch.
-    # PRs never run it — this job is the only one that needs the LAN, and a PR has nothing
-    # to push (image-check builds PRs on a hosted runner).
+    # PRs never run it: image-check builds them on a hosted runner.
     if: >-
       always()
       && github.event_name != 'pull_request'
       && needs.checks.result == 'success'
       && needs.release.result == 'success'
-    runs-on: [self-hosted, ukubi-build]
+    # TODO(ukubi-ci v0.6.0): pinned to the head of ukubi-ci PR #11 (adds push-default-branch-only
+    # and extra-tags). Re-pin to the v0.6.0 commit sha once that is merged and tagged, before
+    # merging this PR; then bump the release and image-check pins above to the same tag.
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@85a8a54aab38de9020950781ca7eb1089dd9dde9 # TODO v0.6.0
+    with:
+      runs-on: '["self-hosted","ukubi-build"]'
+      image: ukubi-stt
+      # The release commit by its tag. Empty on a dry run, or when nothing was released
+      # and the tip is untagged: then the triggering commit.
+      ref: ${{ needs.release.outputs.tag }}
+      version-arg: true
+      version: ${{ needs.release.outputs.version }}
+      # ~5 GB CUDA image: layers would sit on the shared thin-provisioned disk. The base
+      # is refreshed (pull-newer) so a security rebuild picks up patched CUDA/Ubuntu layers.
+      layers: false
+      pull-newer: true
+      # zot keeps `latest` plus only 2 pushed tags: a branch build would evict the rollback
+      # image and overwrite latest with unreleased code, so only the default branch pushes.
+      push-default-branch-only: true
+      extra-tags: latest
     permissions:
-      contents: read
-      id-token: write
-    outputs:
-      tag: ${{ steps.tag.outputs.value }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          # The release commit by its tag. Empty on a dry run, or when nothing was released
-          # and the tip is untagged: then the triggering commit. Checking out main on a
-          # release run would race the next push.
-          ref: ${{ needs.release.outputs.tag }}
-          fetch-depth: 0
-
-      # The image is tagged with the commit, not the version: a version tag would be pushed
-      # again for every build that releases nothing, and zot keeps only the 2 most recently
-      # pushed ukubi-stt tags, so a second tag per build would halve the rollback window.
-      # The version rides along as a build-arg (OCI label, start line, --version).
-      - name: Compute the image tag
-        id: tag
-        run: echo "value=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-
-      # Only REGISTRY_PASSWORD, not the whole environment.
-      - name: Read the registry password from Infisical
-        uses: Infisical/secrets-action@v1.0.12
-        with:
-          method: oidc
-          identity-id: ${{ env.INFISICAL_IDENTITY_ID }}
-          oidc-audience: infisical.bnei.dev
-          domain: ${{ env.INFISICAL_DOMAIN }}
-          project-slug: ${{ env.INFISICAL_PROJECT_SLUG }}
-          env-slug: ${{ env.INFISICAL_ENV }}
-          secret-path: /
-          secret-name: REGISTRY_PASSWORD
-          export-type: env
-
-      # GitHub only auto-masks `secrets.*`, and this action's README does not document
-      # masking. An unmasked Infisical value leaked a token in cleartext in this estate once.
-      - name: Mask the fetched password
-        run: echo "::add-mask::$REGISTRY_PASSWORD"
-
-      - name: Registry login
-        run: |
-          set -euo pipefail
-          [ -n "${REGISTRY_PASSWORD:-}" ] || { echo "Infisical returned no REGISTRY_PASSWORD"; exit 1; }
-          printf '%s' "$REGISTRY_PASSWORD" | sudo buildah login \
-            --tls-verify=false \
-            --username "$REGISTRY_USER" \
-            --password-stdin "$REGISTRY"
-
-      - name: Build and push
-        env:
-          TAG: ${{ steps.tag.outputs.value }}
-          VERSION: ${{ needs.release.outputs.version }}
-          RELEASE_TAG: ${{ needs.release.outputs.tag }}
-        run: |
-          set -euo pipefail
-          # An empty or misnamed output would ship version "" silently. Empty is valid only
-          # untagged: no release exists yet and main moved on.
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ( -z "$VERSION" && -z "$RELEASE_TAG" ) ]] \
-            || { echo "::error::bad VERSION '$VERSION' from release; rerun: gh workflow run image.yml --ref main"; exit 1; }
-          # No release tag: this commit is not a release. On main VERSION is the last release
-          # (main moved on mid-release, or nothing releasable), so X.Y.Z+<sha>. Elsewhere it is
-          # a dry run and VERSION the release it would cut, so X.Y.Z-dev+<sha>. 0.0.0 before
-          # the first release.
-          if [ -z "$RELEASE_TAG" ]; then
-            if [ "$GITHUB_REF" = refs/heads/main ]; then
-              VERSION="${VERSION:-0.0.0}+$TAG"
-            else
-              VERSION="${VERSION:-0.0.0}-dev+$TAG"
-            fi
-          fi
-          sudo buildah bud \
-            --isolation chroot \
-            --format docker \
-            -f Dockerfile \
-            --build-arg "VERSION=$VERSION" \
-            -t "$REGISTRY/$IMAGE:$TAG" \
-            -t "$REGISTRY/$IMAGE:latest" \
-            .
-          # latest stays because zot's retention pins it for ukubi-stt. Only main pushes: zot
-          # keeps just 2 ukubi-stt tags, so a branch build would evict the rollback image and
-          # overwrite latest with unreleased code.
-          if [ "$GITHUB_REF" = refs/heads/main ]; then
-            for t in "$TAG" latest; do
-              sudo buildah push --tls-verify=false "$REGISTRY/$IMAGE:$t"
-            done
-          fi
-          # The LXC shares one thin-provisioned rootfs with the other build
-          # repos and this image is ~5GB. Leaving it behind fills the pool.
-          sudo buildah rmi "$REGISTRY/$IMAGE:$TAG" "$REGISTRY/$IMAGE:latest" || true
-
-  # Only now does ArgoCD get told about the new tag. Shape copied from
-  # agent-fleet's docker.yml, including its two hard-won details.
-  deploy:
-    needs: [build-push]
-    # always() + an explicit result check, not a bare `if: github.event_name ==
-    # 'push'`. agent-fleet recorded this from a live v1.1.0 run: the build
-    # genuinely succeeded and deploy was still skipped with zero steps, because
-    # a job's implicit default condition is success()-on-needs and the job graph
-    # was tripping it. always() bypasses the implicit check, so the explicit
-    # comparison below is what actually guards against deploying a failed build.
-    # Only main deploys: a dispatch on another branch builds that branch and stops here.
-    if: >-
-      always() && github.ref == 'refs/heads/main' &&
-      needs.build-push.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    # The tag build-push actually pushed, not the ref name. This used to be the ref name,
-    # which only worked because the workflow was tag-triggered; on a branch push that is
-    # "main", and this job would have pinned `tag: "main"`. Taking it from the build job
-    # means the manifest pins exactly the artifact that exists.
-    env:
-      TAG: ${{ needs.build-push.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: main
-          fetch-depth: 0
-
-      - name: Bump the pinned image tag
-        run: |
-          set -euo pipefail
-          [ -n "$TAG" ] || { echo "::error::empty image tag"; exit 1; }
-          sed -i -E "s/^(  tag: \")[^\"]+(\")/\1${TAG}\2/" helm/values.yaml
-
-          # A no-op sed is the real failure mode here: if the pattern stops
-          # matching, values.yaml keeps naming the previous release, ArgoCD
-          # redeploys nothing, and the workflow is green. Silence would read as
-          # success, so assert the tag actually landed.
-          grep -q "^  tag: \"${TAG}\"$" helm/values.yaml || {
-            echo "::error::image.tag was not bumped in helm/values.yaml — check the sed against the file's actual indentation"
-            exit 1
-          }
-
-      # Pushing with the default GITHUB_TOKEN credential deliberately does NOT
-      # trigger other workflow runs, so this commit cannot re-enter a
-      # push-to-main trigger and start a release loop.
-      - name: Commit and push
-        run: |
-          set -euo pipefail
-          git config user.name "ukubi-stt-ci"
-          git config user.email "noreply@bnei.dev"
-          git add helm/values.yaml
-          if git diff --cached --quiet; then
-            echo "image tag already at ${TAG}, nothing to commit"
-            exit 0
-          fi
-          git commit -m "chore(deploy): bump image tag to ${TAG}"
-          git push origin HEAD:main
+      contents: write # the deploy job pushes the bump
+      id-token: write # the Infisical OIDC login

@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   trailers:
-    uses: MohammadBnei/ukubi-ci/.github/workflows/trailers.yml@e784a69d5fe0b258b1b6899f89d42ee87eb89d5c # v0.2.1
+    uses: MohammadBnei/ukubi-ci/.github/workflows/trailers.yml@8782d42e1d4e5cd0b8af9d1a14c9d5414976a4c9 # v0.7.0
     with:
       conventional: true
       agent-trailers: pair

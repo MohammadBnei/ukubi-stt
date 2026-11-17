@@ -43,17 +43,17 @@ jobs:
   checks:
     uses: ./.github/workflows/ci.yml
 
-  # PRs only: prove the Dockerfile builds (buildah, GitHub-hosted, no push), after checks so a
+  # PRs only: prove the Dockerfile builds (buildah on the build runner, no push), after checks so a
   # red fmt/clippy does not also pay for the CUDA build. No --layers and no --pull=newer, so it
   # runs image.yml's plain `buildah bud`. Never narrow it with `target: build`: the runtime
-  # stage's ORT provider .so COPY is what this check exists to catch. If the hosted runner runs
-  # out of disk, free space on the runner instead.
+  # stage's ORT provider .so COPY is what this check exists to catch. If the runner runs
+  # out of disk, free space on it instead.
   image-check:
     needs: checks
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
-    uses: MohammadBnei/ukubi-ci/.github/workflows/image-build.yml@d3e4b977a58ab1b97dffebeb16674be2690d2b02 # v0.6.0
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image-build.yml@8782d42e1d4e5cd0b8af9d1a14c9d5414976a4c9 # v0.7.0
     with:
       image: ukubi-stt
       layers: false
@@ -69,7 +69,7 @@ jobs:
     needs: checks
     permissions:
       contents: write
-    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@d3e4b977a58ab1b97dffebeb16674be2690d2b02 # v0.6.0
+    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@8782d42e1d4e5cd0b8af9d1a14c9d5414976a4c9 # v0.7.0
 
   # Build, push and deploy live in ukubi-ci's image.yml: it builds on the build-runner LXC,
   # pushes <sha12> (and latest, same digest) to the in-cluster Zot registry, then pins
@@ -83,13 +83,13 @@ jobs:
   image:
     needs: [checks, release]
     # always() plus explicit results, so the condition reads the same for push and dispatch.
-    # PRs never run it: image-check builds them on a hosted runner.
+    # PRs never run it: image-check builds them.
     if: >-
       always()
       && github.event_name != 'pull_request'
       && needs.checks.result == 'success'
       && needs.release.result == 'success'
-    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@d3e4b977a58ab1b97dffebeb16674be2690d2b02 # v0.6.0
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@8782d42e1d4e5cd0b8af9d1a14c9d5414976a4c9 # v0.7.0
     with:
       runs-on: '["self-hosted","ukubi-build"]'
       image: ukubi-stt

@@ -52,7 +52,9 @@ jobs:
   # out of disk, free space on the runner instead.
   image-check:
     needs: checks
-    if: github.event_name == 'pull_request'
+    # Forgejo evaluates a uses: job's if inside the called jobs, where
+    # event_name is workflow_call; the payload still says what triggered the run.
+    if: github.event.pull_request
     permissions:
       contents: read
     uses: MohammadBnei/ukubi-ci/.github/workflows/image-build.yml@9af316b5d779b2d5ef3f55b9f11e20b8bf3f6ce8 # v0.11.1
@@ -86,10 +88,12 @@ jobs:
   image:
     needs: [checks, release]
     # always() plus explicit results, so the condition reads the same for push and dispatch.
-    # PRs never run it: image-check builds them on a hosted runner.
+    # PRs never run it (image-check builds them). The PR test reads the payload: Forgejo
+    # evaluates this if inside the called jobs, where event_name is workflow_call; and an
+    # equality, not !, which Forgejo mis-evaluates in long expressions.
     if: >-
       always()
-      && github.event_name != 'pull_request'
+      && github.event.pull_request == null
       && needs.checks.result == 'success'
       && needs.release.result == 'success'
     uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@9af316b5d779b2d5ef3f55b9f11e20b8bf3f6ce8 # v0.11.1

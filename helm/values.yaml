@@ -16,7 +16,11 @@ image:
   tag: "a3fef055c95f@sha256:5790b1718cd813a405d636d1c449bc1c6e26b3d034d5097dfd899ed348f4e132"
   pullPolicy: IfNotPresent
 
-replicaCount: 1
+# Scaled to 0 on 2026-11-21: no node in the Talos cluster has a GPU, and the
+# nodeSelector below still pins the old kubespray GPU node (k8s-worker-01),
+# which is gone, so the pod sat Pending. Set back to 1 once a GPU node is in
+# the Talos cluster (and update the nodeSelector to that node).
+replicaCount: 0
 
 # MANDATORY, not a preference. RollingUpdate defaults to maxSurge 1 /
 # maxUnavailable 0: the new pod requests the only `nvidia.com/gpu` while the old

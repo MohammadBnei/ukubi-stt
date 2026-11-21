@@ -32,7 +32,7 @@ jobs:
   # apt-packages: tonic-prost-build needs protoc. The Dockerfile installs the same
   # protobuf-compiler package; keep the two in step.
   rust:
-    uses: MohammadBnei/ukubi-ci/.github/workflows/rust-checks.yml@e784a69d5fe0b258b1b6899f89d42ee87eb89d5c # v0.2.1
+    uses: MohammadBnei/ukubi-ci/.github/workflows/rust-checks.yml@9af316b5d779b2d5ef3f55b9f11e20b8bf3f6ce8 # v0.11.1
     with:
       apt-packages: protobuf-compiler
 
@@ -59,9 +59,18 @@ jobs:
           # origin/main for buf breaking and for the BREAKING CHANGE: scan.
           fetch-depth: 0
 
-      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
-        with:
-          version: 1.72.0
+      # A pinned release, checked by sha256. Not buf-setup-action: it looks the
+      # release up through GitHub's API, unauthenticated from Forgejo, and the
+      # runners' shared address hits the rate limit.
+      - name: Install buf
+        run: |
+          set -euo pipefail
+          v=1.72.0
+          sha=8720830e26a733da55bb89bcd3cb44849c0965fc0c44fb5d691cccdc64dca5af
+          curl -sSfLo "$RUNNER_TEMP/buf" "https://github.com/bufbuild/buf/releases/download/v$v/buf-Linux-x86_64"
+          echo "$sha  $RUNNER_TEMP/buf" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/buf"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: buf lint
         working-directory: proto

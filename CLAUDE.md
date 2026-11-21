@@ -37,5 +37,5 @@ Not runnable on a Mac: `cargo test` (the test binary fails to link ort-sys, "TRI
 
 ## Deploy
 
-`image.yml` builds and releases on push to main, unless the push touches only `*.md`, `helm/**` or `k8s/**`. Any other file, CI or scripts included, cuts at least a patch release and redeploys the single GPU pod (`strategy: Recreate`, so a short outage). Never hand-edit `image.tag` in `helm/values.yaml`; the pipeline owns it.
-ukubi-ci `release.yml` (git-cliff) cuts `CHANGELOG.md` and a bare `X.Y.Z` tag from the commit types, so the type is the bump. The image is tagged with the 12-char commit SHA and carries the version as the `VERSION` build-arg (OCI label, the `ukubi-stt starting` log line, `--version`).
+`image.yml` builds and releases on push to main, unless the push touches only `*.md`, `helm/**` or `k8s/**`. Any other file, CI or scripts included, cuts at least a patch release and redeploys the single GPU pod (`strategy: Recreate`, so a short outage). Never hand-edit `image.tag`: the pipeline owns it, in `helm/image.yaml` on the `deploy` branch (ArgoCD layers it over `helm/values.yaml`).
+ukubi-ci `release.yml` (git-cliff) cuts a bare annotated `X.Y.Z` tag (notes in its message, nothing committed to main) from the commit types, so the type is the bump. The image is tagged with the 12-char commit SHA and carries the version as the `VERSION` build-arg (OCI label, the `ukubi-stt starting` log line, `--version`).

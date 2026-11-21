@@ -34,7 +34,9 @@ on:
 # dispatch could cancel a main run between its tag push and its deploy.
 concurrency:
   group: release-${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
-  cancel-in-progress: true
+  # A PR run cancels the older one; a main run queues, so a build whose release
+  # tag is already pushed is never cancelled (tag with no image).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The Rust checks, defined once in ci.yml and called here so they gate the release in the
@@ -53,15 +55,15 @@ jobs:
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
-    uses: MohammadBnei/ukubi-ci/.github/workflows/image-build.yml@d3e4b977a58ab1b97dffebeb16674be2690d2b02 # v0.6.0
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image-build.yml@9af316b5d779b2d5ef3f55b9f11e20b8bf3f6ce8 # v0.11.1
     with:
       image: ukubi-stt
       layers: false
       pull-newer: false
 
-  # Cuts the version and CHANGELOG with ukubi-ci's git-cliff release: a bare X.Y.Z tag (it
-  # keeps the prefix the existing 0.8.0 … 0.10.2 tags use), `chore(release): X.Y.Z` touching
-  # CHANGELOG.md only, one atomic push with GITHUB_TOKEN. A push or dispatch on main
+  # Cuts the version with ukubi-ci's git-cliff release: a bare annotated X.Y.Z tag (it keeps
+  # the prefix the existing 0.8.0 … 0.10.2 tags use) on the triggering commit, the notes in
+  # its message; since ukubi-ci 0.11 nothing is committed to main. A push or dispatch on main
   # releases; anything else (PRs included) is a dry run whose would-be version and section go
   # to the step summary. contents: write is needed even on PRs: GitHub checks a called
   # workflow's permissions before any job starts.
@@ -69,14 +71,15 @@ jobs:
     needs: checks
     permissions:
       contents: write
-    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@d3e4b977a58ab1b97dffebeb16674be2690d2b02 # v0.6.0
+    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@9af316b5d779b2d5ef3f55b9f11e20b8bf3f6ce8 # v0.11.1
 
   # Build, push and deploy live in ukubi-ci's image.yml: it builds on the build-runner LXC,
   # pushes <sha12> (and latest, same digest) to the in-cluster Zot registry, then pins
-  # <sha12>@<digest> in helm/values.yaml AFTER the push, never before (a tag bumped ahead of
+  # <sha12>@<digest> in helm/image.yaml on the `deploy` branch (ArgoCD layers it over
+  # helm/values.yaml) AFTER the push, never before (a tag bumped ahead of
   # its image put the Recreate pod into ImagePullBackOff on 0.4.0). The digest pin is what
-  # makes a same-commit security rebuild redeploy. Needs MohammadBnei/ukubi-stt to stay on
-  # the Infisical identity's repository allowlist (infra-bootstrap build-runner-ops).
+  # makes a same-commit security rebuild redeploy. On Forgejo the login is Forgejo OIDC
+  # (Infisical identity ci-forgejo-tier1, any MohammadBnei repo).
   #
   # Deploy impact: `strategy: Recreate` on the single GPU node means every roll, a CVE
   # rebuild included, is a short outage. Scheduling is deliberately untouched here.
@@ -89,9 +92,11 @@ jobs:
       && github.event_name != 'pull_request'
       && needs.checks.result == 'success'
       && needs.release.result == 'success'
-    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@d3e4b977a58ab1b97dffebeb16674be2690d2b02 # v0.6.0
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@9af316b5d779b2d5ef3f55b9f11e20b8bf3f6ce8 # v0.11.1
     with:
-      runs-on: '["self-hosted","ukubi-build"]'
+      # The pin file on the deploy branch (ukubi-ci 0.11), not main's values.
+      values-file: helm/image.yaml
+      runs-on: '["ukubi-build"]'
       image: ukubi-stt
       # The release commit by its tag. Empty on a dry run, or when nothing was released
       # and the tip is untagged: then the triggering commit.

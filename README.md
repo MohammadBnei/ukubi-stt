@@ -57,17 +57,18 @@ ParakeetTDT::from_pretrained(dir, Some(cfg))?
 
 `image.yml`'s `release` job calls ukubi-ci's `release.yml` (git-cliff, from
 Conventional Commits). On every releasable push to `main` it computes the next
-semver since the last `X.Y.Z` tag, prepends that section to `CHANGELOG.md`,
-commits `chore(release): X.Y.Z` (CHANGELOG.md only) and pushes it with an
-annotated bare `X.Y.Z` tag, the same no-`v` form as the earlier release-it
-tags. On a PR it is a dry run: the would-be version and section go to the
+semver since the last `X.Y.Z` tag and pushes an annotated bare `X.Y.Z` tag on
+that commit, the same no-`v` form as the earlier release-it tags, with the
+section as its message (`git tag -n99 X.Y.Z`). Since ukubi-ci 0.11 nothing is
+committed to `main`: `CHANGELOG.md` is history, and the image pin lands in
+`helm/image.yaml` on the `deploy` branch. On a PR it is a dry run: the would-be version and section go to the
 job's step summary. Nothing is run locally.
 
 The commit type is the release: `feat` bumps the minor, everything else not
 skipped at least the patch, and a breaking change bumps the minor while the
 version is `0.x`. `chore(release)`, `chore(deploy)` and merge commits are
-skipped. `CHANGELOG.md` lists features, fixes and performance in their own
-groups and every other commit under "Other".
+skipped. The notes list features, fixes and performance in their own groups
+and every other commit under "Other".
 
 The version is not in any file. `image` (ukubi-ci `image.yml`) checks out the release tag,
 tags the image with the commit's 12-character SHA, and passes the version as
@@ -76,7 +77,7 @@ label, the `version` field of the `ukubi-stt starting` line every mode logs
 first, and what `ukubi-stt --version` prints. A build that is not a release
 reports `X.Y.Z+<sha>` on `main` or `X.Y.Z-dev+<sha>` elsewhere; a plain `cargo
 build` reports `dev`. `deploy` then pins that SHA as `image.tag` in
-`helm/values.yaml` for ArgoCD. To release or rebuild the tip by hand:
+`helm/image.yaml` on the `deploy` branch, which ArgoCD layers over `helm/values.yaml`. To release or rebuild the tip by hand:
 `gh workflow run image.yml --ref main`. With nothing to release the tip is
 usually the `chore(deploy)` bump, so this builds and deploys it as a new
 `X.Y.Z+<sha>` image, not the tagged one.
@@ -100,8 +101,8 @@ service. Run them in a one-shot pod instead.
 - **Persian** (`--selftest-fa`): `k8s/gate-fa-pod.yaml` runs it as is. It needs
   no GPU and no outage.
 - **CUDA** (`--selftest`, `--selftest-stream`): no manifest ships for it. Adapt
-  `gate-fa-pod.yaml`: the current image tag (the SHA in `helm/values.yaml`'s
-  `image.tag`), the command below, and BOTH
+  `gate-fa-pod.yaml`: the current image tag (the SHA in `helm/image.yaml`'s
+  `image.tag` on the `deploy` branch), the command below, and BOTH
   `runtimeClassName: nvidia` and an `nvidia.com/gpu: 1` limit. Neither implies
   the other (ADR-0043 Decision 3): without the RuntimeClass no driver is
   injected, so `nvidia-smi` is missing and the gate reads 0 MiB; without the
@@ -569,11 +570,11 @@ One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below);
 
 | job | runs on | when | proves |
 |---|---|---|---|
-| `checks` (`ci.yml`) | GitHub-hosted | PRs and pushes | fmt, clippy, tests, web page parses, `cargo audit`, `buf lint`; `buf breaking` against `main` on PRs only |
-| `image-check` | GitHub-hosted (buildah, no push) | PRs | the Dockerfile builds |
-| `trailers` (`trailers.yml`) | GitHub-hosted | PRs | Conventional titles/commits, trailer pair |
-| `release` (ukubi-ci `release.yml`) | GitHub-hosted | PRs (dry run) and pushes | git-cliff cuts the version, CHANGELOG and tag |
-| `image` (ukubi-ci `image.yml`) | build-runner LXC (`[self-hosted, ukubi-build]`) for the build, GitHub-hosted for the bump | pushes and dispatches | that it builds into a CUDA image; on `main` it pushes it under the commit SHA (and `latest`, same digest) and pins `image.tag` in `helm/values.yaml` as `<sha>@<digest>`, so a same-commit rebuild redeploys |
+| `checks` (`ci.yml`) | Forgejo container runner (`ubuntu-latest`) | PRs and pushes | fmt, clippy, tests, web page parses, `cargo audit`, `buf lint`; `buf breaking` against `main` on PRs only |
+| `image-check` | build-runner LXC (`ukubi-build`, buildah, no push) | PRs | the Dockerfile builds |
+| `trailers` (`trailers.yml`) | Forgejo container runner | PRs | Conventional titles/commits, trailer pair |
+| `release` (ukubi-ci `release.yml`) | Forgejo container runner | PRs (dry run) and pushes | git-cliff cuts the version and an annotated tag (notes in its message); nothing is committed to `main` |
+| `image` (ukubi-ci `image.yml`) | build-runner LXC (`ukubi-build`) | pushes and dispatches | that it builds into a CUDA image; on `main` it pushes it under the commit SHA (and `latest`, same digest) and pins `image.tag` in `helm/image.yaml` on the `deploy` branch as `<sha>@<digest>`, so a same-commit rebuild redeploys |
 
 A push to `main` that touches only `*.md`, `helm/**`, `k8s/**` (one-shot
 manifests, never in the image) runs nothing. Any other push, a `Cargo.toml`/`Cargo.lock`-only bump included, runs
@@ -596,7 +597,7 @@ and local builds. Run `rustup toolchain install` once in the repo
 (rustup's auto-install of it is deprecated). To bump, edit that file — nothing
 else names the version.
 
-**Rollback** is setting `image.tag` back to an earlier commit's SHA tag — and
+**Rollback** is setting `image.tag` (in `helm/image.yaml` on the `deploy` branch) back to an earlier commit's SHA tag — and
 this repo's retention is tighter than the cluster default: zot keeps `latest`
 and the **2** most recently pushed `ukubi-stt` tags (3 everywhere else),
 because the image is a ~5GB CUDA tree. `latest` is re-pushed with every build
@@ -610,6 +611,6 @@ The image cannot be built on a Mac (it needs CUDA), but fmt, clippy, the web
 syntax check, `cargo audit` and buf lint from `CLAUDE.md` run locally (`cargo test` does not
 link on macOS; CI runs it). Release image builds run
 on the `build-runner` LXC via the `image` workflow; PRs only build-check the image on
-a GitHub-hosted runner (`image-check`, no push) (ADR-0034: one runner
+the same LXC (`image-check`, no push, no login) (ADR-0034: one runner
 instance per repo, buildah under `sudo`, plain-HTTP push to
 `registry.bnei.lan:5000`).

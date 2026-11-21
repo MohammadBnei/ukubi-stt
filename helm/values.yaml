@@ -76,7 +76,14 @@ limitRange:
 # model, which lands in the same volume. Note this shares k8s-worker-01's OS
 # disk with agent-fleet's session volumes.
 persistence:
-  enabled: true
+  # Off while replicaCount is 0 (2026-11-21). With no pod to consume it, the
+  # WaitForFirstConsumer `local-path` claim sat Pending forever and kept the
+  # ArgoCD app Progressing instead of Healthy. It never bound, so it held no
+  # data. Re-enable together with replicaCount: 1 once a GPU node joins Talos;
+  # the PVC will be recreated and the model re-fetched. Also delete the `data`
+  # emptyDir in extraVolumes below at the same time, or the duplicate volume
+  # name makes the API server reject the Deployment.
+  enabled: false
   # Three models now: TDT 2.4GB + Nemotron 2.5GB + Shenava 0.44GB = ~5.4GB
   # (ADR-0046, ADR-0047). Note
   # local-path does not enforce quotas, so this claim is advisory — the real
@@ -122,6 +129,11 @@ securityContext: &restricted
 extraVolumes:
   - name: tmp
     emptyDir: {sizeLimit: 256Mi}
+  # Placeholder for the chart's `data` volume while persistence is off: both
+  # initContainers mount `data`, and a mount with no volume is rejected at
+  # admission. Delete this when persistence.enabled goes back to true.
+  - name: data
+    emptyDir: {sizeLimit: 64Mi} # tiny on purpose: replicaCount 1 without persistence evicts loudly instead of filling the node
 extraVolumeMounts:
   - name: tmp
     mountPath: /tmp

@@ -571,7 +571,6 @@ One pipeline, `image.yml`, on PRs and on pushes to `main` (paths below);
 | job | runs on | when | proves |
 |---|---|---|---|
 | `checks` (`ci.yml`) | Forgejo container runner (`ubuntu-latest`) | PRs and pushes | fmt, clippy, tests, web page parses, `cargo audit`, `buf lint`; `buf breaking` against `main` on PRs only |
-| `image-check` | build-runner LXC (`ukubi-build`, buildah, no push) | PRs | the Dockerfile builds |
 | `trailers` (`trailers.yml`) | Forgejo container runner | PRs | Conventional titles/commits, trailer pair |
 | `release` (ukubi-ci `release.yml`) | Forgejo container runner | PRs (dry run) and pushes | git-cliff cuts the version and an annotated tag (notes in its message); nothing is committed to `main` |
 | `image` (ukubi-ci `image.yml`) | build-runner LXC (`ukubi-build`) | pushes and dispatches | that it builds into a CUDA image; on `main` it pushes it under the commit SHA (and `latest`, same digest) and pins `image.tag` in `helm/image.yaml` on the `deploy` branch as `<sha>@<digest>`, so a same-commit rebuild redeploys |
@@ -610,7 +609,7 @@ and must be rebuilt.
 The image cannot be built on a Mac (it needs CUDA), but fmt, clippy, the web
 syntax check, `cargo audit` and buf lint from `CLAUDE.md` run locally (`cargo test` does not
 link on macOS; CI runs it). Release image builds run
-on the `build-runner` LXC via the `image` workflow; PRs only build-check the image on
-the same LXC (`image-check`, no push, no login) (ADR-0034: one runner
+on the `build-runner` LXC via the `image` workflow; a PR builds no image (owner
+decision, CI/CD split: a Dockerfile break shows on `main`) (ADR-0034: one runner
 instance per repo, buildah under `sudo`, plain-HTTP push to
 `registry.bnei.lan:5000`).

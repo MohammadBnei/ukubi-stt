@@ -32,7 +32,7 @@ jobs:
   # apt-packages: tonic-prost-build needs protoc. The Dockerfile installs the same
   # protobuf-compiler package; keep the two in step.
   rust:
-    uses: MohammadBnei/ukubi-ci/.github/workflows/rust-checks.yml@9af316b5d779b2d5ef3f55b9f11e20b8bf3f6ce8 # v0.11.1
+    uses: MohammadBnei/ukubi-ci/.github/workflows/rust-checks.yml@a1fff4170c861af16467a99fe5185bbb85bdfd08 # v0.11.3
     with:
       apt-packages: protobuf-compiler
 
@@ -76,13 +76,14 @@ jobs:
         working-directory: proto
         run: buf lint
 
-      # PRs only: on a push to main, HEAD is main. A called workflow sees the
-      # caller's event, so this is image.yml's pull_request. A deliberate break
+      # PRs only: on a push to main, HEAD is main. The PR payload, not
+      # event_name, which Forgejo reports as workflow_call inside a called
+      # workflow (so this step never ran there). A deliberate break
       # opts out by declaring `BREAKING CHANGE:` in a commit, which git-cliff
       # (ukubi-ci release) also reads as a breaking bump — the minor while on
       # 0.x — so the skip is visible in the version too.
       - name: buf breaking (against main)
-        if: github.event_name == 'pull_request'
+        if: github.event.pull_request
         working-directory: proto
         run: |
           if git log --format='%B' origin/main..HEAD | grep -q '^BREAKING CHANGE:'; then

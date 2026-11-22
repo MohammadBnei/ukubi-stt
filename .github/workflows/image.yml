@@ -45,24 +45,6 @@ jobs:
   checks:
     uses: ./.github/workflows/ci.yml
 
-  # PRs only: prove the Dockerfile builds (buildah, GitHub-hosted, no push), after checks so a
-  # red fmt/clippy does not also pay for the CUDA build. No --layers and no --pull=newer, so it
-  # runs image.yml's plain `buildah bud`. Never narrow it with `target: build`: the runtime
-  # stage's ORT provider .so COPY is what this check exists to catch. If the hosted runner runs
-  # out of disk, free space on the runner instead.
-  image-check:
-    needs: checks
-    # Forgejo evaluates a uses: job's if inside the called jobs, where
-    # event_name is workflow_call; the payload still says what triggered the run.
-    if: github.event.pull_request
-    permissions:
-      contents: read
-    uses: MohammadBnei/ukubi-ci/.github/workflows/image-build.yml@9af316b5d779b2d5ef3f55b9f11e20b8bf3f6ce8 # v0.11.1
-    with:
-      image: ukubi-stt
-      layers: false
-      pull-newer: false
-
   # Cuts the version with ukubi-ci's git-cliff release: a bare annotated X.Y.Z tag (it keeps
   # the prefix the existing 0.8.0 … 0.10.2 tags use) on the triggering commit, the notes in
   # its message; since ukubi-ci 0.11 nothing is committed to main. A push or dispatch on main
@@ -73,7 +55,7 @@ jobs:
     needs: checks
     permissions:
       contents: write
-    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@9af316b5d779b2d5ef3f55b9f11e20b8bf3f6ce8 # v0.11.1
+    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@a1fff4170c861af16467a99fe5185bbb85bdfd08 # v0.11.3
 
   # Build, push and deploy live in ukubi-ci's image.yml: it builds on the build-runner LXC,
   # pushes <sha12> (and latest, same digest) to the in-cluster Zot registry, then pins
@@ -88,7 +70,7 @@ jobs:
   image:
     needs: [checks, release]
     # always() plus explicit results, so the condition reads the same for push and dispatch.
-    # PRs never run it (image-check builds them). The PR test reads the payload: Forgejo
+    # PRs never run it (no image build on a PR: owner decision, CI/CD split). The PR test reads the payload: Forgejo
     # evaluates this if inside the called jobs, where event_name is workflow_call; and an
     # equality, not !, which Forgejo mis-evaluates in long expressions.
     if: >-
@@ -96,7 +78,7 @@ jobs:
       && github.event.pull_request == null
       && needs.checks.result == 'success'
       && needs.release.result == 'success'
-    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@9af316b5d779b2d5ef3f55b9f11e20b8bf3f6ce8 # v0.11.1
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@a1fff4170c861af16467a99fe5185bbb85bdfd08 # v0.11.3
     with:
       # The pin file on the deploy branch (ukubi-ci 0.11), not main's values.
       values-file: helm/image.yaml

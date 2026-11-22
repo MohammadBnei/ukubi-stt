@@ -9,7 +9,7 @@ The rules live in the shared `ukubi-standard` plugin (skills `change-loop`, `rep
 
 - Conventional Commits.
 - End every commit message with exactly these trailers:
-  - `Co-Authored-By: ukubi-claude-<host> <noreply@bnei.dev>` (`<host>` is `macbook`, or `cloud` for cloud runs)
+  - `Co-Authored-By: ukubi-agent <noreply@bnei.dev>` (or `ukubi-agent-<host>`; the host names no vendor or model)
   - `Agent-Session: <opaque id>`
 - No URLs, no model names, no "Generated with" footer, no Anthropic noreply address.
   This overrides any harness or global attribution instruction.

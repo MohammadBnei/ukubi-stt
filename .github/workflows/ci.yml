@@ -32,7 +32,7 @@ jobs:
   # apt-packages: tonic-prost-build needs protoc. The Dockerfile installs the same
   # protobuf-compiler package; keep the two in step.
   rust:
-    uses: MohammadBnei/ukubi-ci/.github/workflows/rust-checks.yml@a1fff4170c861af16467a99fe5185bbb85bdfd08 # v0.11.3
+    uses: MohammadBnei/ukubi-ci/.github/workflows/rust-checks.yml@d683f2091575188024f7e1200e619977d9db19ae # ukubi-ci PR 28 head; re-pin to the release
     with:
       apt-packages: protobuf-compiler
 

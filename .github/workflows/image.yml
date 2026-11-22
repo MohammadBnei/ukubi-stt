@@ -55,7 +55,7 @@ jobs:
     needs: checks
     permissions:
       contents: write
-    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@a1fff4170c861af16467a99fe5185bbb85bdfd08 # v0.11.3
+    uses: MohammadBnei/ukubi-ci/.github/workflows/release.yml@d683f2091575188024f7e1200e619977d9db19ae # ukubi-ci PR 28 head; re-pin to the release
 
   # Build, push and deploy live in ukubi-ci's image.yml: it builds on the build-runner LXC,
   # pushes <sha12> (and latest, same digest) to the in-cluster Zot registry, then pins
@@ -78,7 +78,7 @@ jobs:
       && github.event.pull_request == null
       && needs.checks.result == 'success'
       && needs.release.result == 'success'
-    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@a1fff4170c861af16467a99fe5185bbb85bdfd08 # v0.11.3
+    uses: MohammadBnei/ukubi-ci/.github/workflows/image.yml@d683f2091575188024f7e1200e619977d9db19ae # ukubi-ci PR 28 head; re-pin to the release
     with:
       # The pin file on the deploy branch (ukubi-ci 0.11), not main's values.
       values-file: helm/image.yaml

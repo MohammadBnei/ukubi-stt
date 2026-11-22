@@ -92,3 +92,11 @@ jobs:
             exit 0
           fi
           buf breaking --against '../.git#ref=origin/main,subdir=proto'
+
+  # hadolint on the Dockerfile; no image build on a PR (owner decision, CI/CD split).
+  dockerfile:
+    uses: MohammadBnei/ukubi-ci/.github/workflows/dockerfile-lint.yml@d683f2091575188024f7e1200e619977d9db19ae # ukubi-ci PR 28 head; re-pin to the release
+    with:
+      dockerfiles: Dockerfile
+      # DL3008/DL4006 warnings in the CUDA image: only errors fail until they are fixed
+      failure-threshold: error

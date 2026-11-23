@@ -16,11 +16,9 @@ image:
   tag: "a3fef055c95f@sha256:5790b1718cd813a405d636d1c449bc1c6e26b3d034d5097dfd899ed348f4e132"
   pullPolicy: IfNotPresent
 
-# Scaled to 0 on 2026-11-21: no node in the Talos cluster has a GPU, and the
-# nodeSelector below still pins the old kubespray GPU node (k8s-worker-01),
-# which is gone, so the pod sat Pending. Set back to 1 once a GPU node is in
-# the Talos cluster (and update the nodeSelector to that node).
-replicaCount: 0
+# One pod: there is one GPU (talos-gpu-1's RTX 2070 SUPER). Was 0 from
+# 2026-11-21 until talos-gpu-1 joined the Talos cluster on 2026-11-23.
+replicaCount: 1
 
 # MANDATORY, not a preference. RollingUpdate defaults to maxSurge 1 /
 # maxUnavailable 0: the new pod requests the only `nvidia.com/gpu` while the old
@@ -37,7 +35,7 @@ strategy:
 # limit the scheduler does not account for the GPU. ADR-0043 Decisions 2/3.
 runtimeClassName: nvidia
 nodeSelector:
-  kubernetes.io/hostname: k8s-worker-01
+  kubernetes.io/hostname: talos-gpu-1
 
 service:
   # /healthz and /livez. Never routed externally — only :9090 gets a route.
@@ -73,28 +71,15 @@ limitRange:
 # one node with no HA, so a node-pinned volume loses nothing that was promised.
 #
 # 8Gi against ~2.4GB today. The headroom is for Phase E's second (streaming)
-# model, which lands in the same volume. Note this shares k8s-worker-01's OS
-# disk with agent-fleet's session volumes.
+# model, which lands in the same volume. local-path on talos-gpu-1 is a
+# directory on its EPHEMERAL volume (25% of its 500 GB disk).
 persistence:
-  # Off while replicaCount is 0 (2026-11-21). With no pod to consume it, the
-  # WaitForFirstConsumer `local-path` claim sat Pending forever and kept the
-  # ArgoCD app Progressing instead of Healthy. It never bound, so it held no
-  # data. Re-enable together with replicaCount: 1 once a GPU node joins Talos;
-  # the PVC will be recreated and the model re-fetched. Also delete the `data`
-  # emptyDir in extraVolumes below at the same time, or the duplicate volume
-  # name makes the API server reject the Deployment.
-  enabled: false
+  enabled: true
   # Three models now: TDT 2.4GB + Nemotron 2.5GB + Shenava 0.44GB = ~5.4GB
   # (ADR-0046, ADR-0047). Note
   # local-path does not enforce quotas, so this claim is advisory — the real
-  # constraint is k8s-worker-01's OS disk, shared with agent-fleet's session
-  # volumes (19GB free of 96GB as of 2026-09-01).
+  # constraint is talos-gpu-1's EPHEMERAL volume.
   #
-  # AND IT IS FICTION IN A SECOND WAY: the bound PVC is 8Gi, not 12Gi. local-path
-  # cannot expand, so raising this number never took effect and never will for the
-  # existing claim — changing it would need the PVC deleted and the models
-  # re-downloaded. Left at 12Gi so a rebuilt node gets the larger claim; do not
-  # read it as what is mounted today.
   size: 12Gi
   storageClass: local-path
   mountPath: /models
@@ -129,11 +114,6 @@ securityContext: &restricted
 extraVolumes:
   - name: tmp
     emptyDir: {sizeLimit: 256Mi}
-  # Placeholder for the chart's `data` volume while persistence is off: both
-  # initContainers mount `data`, and a mount with no volume is rejected at
-  # admission. Delete this when persistence.enabled goes back to true.
-  - name: data
-    emptyDir: {sizeLimit: 64Mi} # tiny on purpose: replicaCount 1 without persistence evicts loudly instead of filling the node
 extraVolumeMounts:
   - name: tmp
     mountPath: /tmp

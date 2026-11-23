@@ -70,16 +70,13 @@ limitRange:
 # data whose recovery procedure is `curl`. This workload is already pinned to
 # one node with no HA, so a node-pinned volume loses nothing that was promised.
 #
-# 8Gi against ~2.4GB today. The headroom is for Phase E's second (streaming)
-# model, which lands in the same volume. local-path on talos-gpu-1 is a
-# directory on its EPHEMERAL volume (25% of its 500 GB disk).
+# 12Gi against ~5.4GB of models. local-path on talos-gpu-1 is a directory on
+# its EPHEMERAL volume (~120 GB).
 persistence:
   enabled: true
-  # Three models now: TDT 2.4GB + Nemotron 2.5GB + Shenava 0.44GB = ~5.4GB
-  # (ADR-0046, ADR-0047). Note
-  # local-path does not enforce quotas, so this claim is advisory — the real
-  # constraint is talos-gpu-1's EPHEMERAL volume.
-  #
+  # Three models: TDT 2.4GB + Nemotron 2.5GB + Shenava 0.44GB = ~5.4GB
+  # (ADR-0046, ADR-0047). local-path does not enforce quotas, so this claim is
+  # advisory; the real constraint is talos-gpu-1's EPHEMERAL volume.
   size: 12Gi
   storageClass: local-path
   mountPath: /models
@@ -127,15 +124,16 @@ extraVolumeMounts:
 # interpolated rather than hardcoded; a literal here would silently drift from
 # image.tag on every bump and fetch with a stale script.
 initContainers:
-  # The existing weights were written by root (fetch-model ran as root until
-  # now), and fsGroup does not re-own files on a local-path volume, so 10001
+  # Weights written by root (fetch-model once ran as root; k8s/gate-fa-pod.yaml
+  # still does) would block uid 10001, and fsGroup does not re-own files on a local-path volume, so 10001
   # could not fetch a missing file. This re-owns them on every start: the
   # pod's only root process, holding CAP_CHOWN and nothing else. It also
   # re-owns anything k8s/gate-fa-pod.yaml (still root) writes. Limit: CHOWN
   # alone cannot enter a 0700 dir it does not own — fetch-model creates 0755.
   #
-  # This container means the pod needs PSA `baseline`, not `restricted`. When
-  # ADR-0040 Decision 6 labels this namespace, use baseline — or delete this
+  # This container means the pod needs PSA `baseline`, not `restricted` (the
+  # namespace is `privileged` today). When ADR-0040 Decision 6 labels this
+  # namespace, use baseline — or delete this
   # container once no root writer of /models is left.
   - name: chown-models
     image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

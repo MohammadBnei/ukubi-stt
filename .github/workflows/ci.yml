@@ -18,6 +18,8 @@ name: ci
 # gate happen in one run. Triggering here as well would run them twice on every push and
 # leave the release depending on a different run than the one you are looking at.
 on:
+  # PRs run the checks here, on the Talos runner; main runs them through image.yml (workflow_call).
+  pull_request:
   workflow_call:
 
 jobs:

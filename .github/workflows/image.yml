@@ -9,7 +9,8 @@ name: image
 # the same chain; a dispatch elsewhere is a dry-run release and a build, never a push or deploy.
 on:
   workflow_dispatch:
-  pull_request:
+  # No pull_request: a PR runs ci.yml's checks itself, so no PR event ever reaches the
+  # ukubi-build (CT 103) image job, not even behind an if:.
   push:
     branches:
       - main

@@ -1,7 +1,7 @@
 # Shift the compile check left. The image build takes ~15 minutes on the
 # build-runner LXC pulling a multi-GB CUDA tree; a syntax error should not cost
-# that. image.yml calls this on PRs and on pushes to main that are not
-# docs/helm/k8s only, on the Talos runner (k8s-ubuntu-latest) with no GPU, and nothing
+# that. A PR triggers it directly; image.yml calls it on pushes to main that are not
+# docs/helm/k8s only. Both run on the Talos runner (k8s-ubuntu-latest) with no GPU, and nothing
 # after it (release, build, deploy) runs if it is red.
 #
 # It cannot prove CUDA engages — that is the startup assertion's job on real
@@ -14,14 +14,19 @@
 # of which a `cargo clippy` on a hosted runner can reach.
 name: ci
 
-# Called by image.yml rather than triggered directly, so the checks and the release they
-# gate happen in one run. Triggering here as well would run them twice on every push and
-# leave the release depending on a different run than the one you are looking at.
+# On main it is called by image.yml rather than triggered on push, so the checks and the
+# release they gate happen in one run. A PR triggers it directly: no PR event reaches
+# image.yml, whose image job runs on CT 103.
 on:
   # PRs run the checks here, on the Talos runner; main runs them through image.yml (workflow_call).
   pull_request:
   workflow_call:
 
+
+# A newer push to a PR cancels its older run; a call from image.yml shares image.yml's group.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event.pull_request && true || false }}
 jobs:
   # fmt, clippy, test and cargo audit come from ukubi-ci, pinned by sha. CI only proves
   # compile, format, lint, tests. Blocking audit ignores live in .cargo/audit.toml with

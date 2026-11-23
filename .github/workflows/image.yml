@@ -49,8 +49,9 @@ jobs:
   # Cuts the version with ukubi-ci's git-cliff release: a bare annotated X.Y.Z tag (it keeps
   # the prefix the existing 0.8.0 … 0.10.2 tags use) on the triggering commit, the notes in
   # its message; since ukubi-ci 0.11 nothing is committed to main. A push or dispatch on main
-  # releases; anything else (PRs included) is a dry run whose would-be version and section go
-  # to the step summary. contents: write is needed even on PRs: GitHub checks a called
+  # releases; a dispatch on a branch is a dry run whose would-be version and section go
+  # to the step summary. PRs no longer reach this file (ci.yml runs their checks), so they
+  # get no release dry run. contents: write is needed even on PRs: GitHub checks a called
   # workflow's permissions before any job starts.
   release:
     needs: checks

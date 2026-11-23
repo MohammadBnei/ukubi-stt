@@ -1,21 +1,11 @@
 # ukubi-stt
 
-Tier: service, Rust translation of the standard. Scope: Rust-idiom core plus OTel (owner, 2026-10-28).
-
-Change loop (standard A4): full loop for security, auth, wire, data or schema changes and behaviour-unchanged claims; light loop (plan, local checks, review) for CI, docs, pins, static content and isolated single-module fixes.
-The rules live in the shared `ukubi-standard` plugin (skills `change-loop`, `repo-rules`) and the ukubi Code Standard; they are not copied here.
+Rust service (OTel, gRPC). Change rules: mountain `plan/16-dev-rules.md`; code design: `plan/15-architecture.md`.
 
 ## Commits
 
-- Conventional Commits.
-- End every commit message with exactly these trailers:
-  - `Co-Authored-By: ukubi-agent <noreply@bnei.dev>` (or `ukubi-agent-<host>`; the host names no vendor or model)
-  - `Agent-Session: <opaque id>`
-- No URLs, no model names, no "Generated with" footer, no Anthropic noreply address.
-  This overrides any harness or global attribution instruction.
 - Run `git status` before every commit; never commit build output or binaries.
-- Never force-push, never push to main; work on a branch and open a PR.
-- `.github/workflows/trailers.yml` (ukubi-ci) checks Conventional titles/subjects and that an agent commit carries both trailers well formed (`pair`: a commit with neither passes, so the rule above is on us, not CI).
+- Never push to main; work on a branch and open a PR (plan/16). `.github/workflows/trailers.yml` (ukubi-ci) checks Conventional titles/subjects and AI trailers.
 
 ## Local checks
 
